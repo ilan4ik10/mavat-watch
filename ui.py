@@ -188,7 +188,7 @@ PAGE = """<!doctype html>
 
   <div class="add-card">
     <p class="section-title">הוספת תכנית למעקב</p>
-    <form action="/add" onsubmit="return submitForm(this, 'מוסיף את התוכנית שלך למעקב ברגעים אלה')">
+    <form method="post" action="/add" onsubmit="submitForm(this, 'מוסיף את התוכנית שלך למעקב ברגעים אלה'); return false">
       <button class="primary" type="submit">+ הוסף</button>
       <input type="url" name="url" required dir="ltr"
              placeholder="https://mavat.iplan.gov.il/SV4/1/3005115162/310"
@@ -217,16 +217,16 @@ PAGE = """<!doctype html>
       </div>
 
       <div class="actions">
-        <form action="/check/{{ t.id }}"
-              onsubmit="return submitForm(this, 'בודק את התכנית ברגעים אלה')">
+        <form method="post" action="/check/{{ t.id }}"
+              onsubmit="submitForm(this, 'בודק את התכנית ברגעים אלה'); return false">
           <button class="primary" type="submit">בדוק עכשיו</button>
         </form>
-        <form action="/simulate/{{ t.id }}"
-              onsubmit="return submitForm(this, 'מבצע סימולציה')">
+        <form method="post" action="/simulate/{{ t.id }}"
+              onsubmit="submitForm(this, 'מבצע סימולציה'); return false">
           <button class="ghost" type="submit" title="שינוי הבסיס באופן מלאכותי כדי שהבדיקה הבאה תדווח על שינוי לצורך הדגמה">סימולציה</button>
         </form>
-        <form action="/remove/{{ t.id }}"
-              onsubmit="return submitForm(this, 'מסיר את התכנית מהמעקב', 'להפסיק את המעקב אחר {{ t.label }}?')">
+        <form method="post" action="/remove/{{ t.id }}"
+              onsubmit="submitForm(this, 'מסיר את התכנית מהמעקב', 'להפסיק את המעקב אחר {{ t.label }}?'); return false">
           <button class="danger" type="submit">הסר</button>
         </form>
       </div>
