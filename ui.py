@@ -5,148 +5,322 @@
 # ///
 from __future__ import annotations
 
-from dataclasses import asdict
+import threading
+import time
+from datetime import datetime
 
 from flask import Flask, render_template_string, request
 
-from mavat_watch import DEFAULT_URL, SECTIONS, load_state, run_check, simulate
+from mavat_watch import (
+    add_track,
+    check_track,
+    list_tracks,
+    load_history,
+    load_track,
+    nice_plan_label,
+    remove_track,
+    simulate_track,
+    url_id,
+)
+
+CHECK_INTERVAL_SECONDS = 60
 
 app = Flask(__name__)
+check_lock = threading.Lock()
+
+
+def background_checker():
+    while True:
+        time.sleep(CHECK_INTERVAL_SECONDS)
+        with check_lock:
+            for track in list_tracks():
+                try:
+                    check_track(track["url"], send_emails=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[background] {track['url']}: {type(exc).__name__}: {exc}", flush=True)
+
+
+threading.Thread(target=background_checker, daemon=True).start()
+
+
+def humanize(iso_ts):
+    then = datetime.fromisoformat(iso_ts)
+    delta = datetime.now() - then
+    seconds = delta.total_seconds()
+    if seconds < 60:
+        return "ממש עכשיו"
+    if seconds < 3600:
+        return f"לפני {int(seconds // 60)} דק'"
+    if seconds < 86400:
+        return f"לפני {int(seconds // 3600)} שעות"
+    return f"לפני {int(seconds // 86400)} ימים"
+
+
+def nice_ts(iso_ts):
+    try:
+        return datetime.fromisoformat(iso_ts).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return iso_ts
+
+
+ACTION_LABEL_HE = {"NEW": "חדש", "UPDATED": "עודכן", "REMOVED": "הוסר"}
+
+app.jinja_env.filters["humanize"] = humanize
+app.jinja_env.filters["nice_ts"] = nice_ts
+app.jinja_env.filters["action_he"] = lambda a: ACTION_LABEL_HE.get(a, a)
+
 
 PAGE = """<!doctype html>
-<html lang="en" dir="ltr">
+<html lang="he" dir="rtl">
 <head>
 <meta charset="utf-8">
-<title>Mavat Watch</title>
+<title>מעקב מבאת</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-         max-width: 820px; margin: 2em auto; padding: 0 1em; color: #1f2937; }
-  h1 { margin: 0 0 0.2em; font-size: 24px; }
-  p.lead { color: #6b7280; margin-top: 0; }
-  form { display: flex; gap: 0.5em; margin: 1.5em 0 0.5em; }
-  input[type=text] { flex: 1; padding: 0.7em; font-size: 14px;
-                     border: 1px solid #d1d5db; border-radius: 6px; }
-  button { padding: 0.7em 1.2em; background: #2563eb; color: white;
-           border: 0; border-radius: 6px; font-size: 14px; cursor: pointer; }
-  button.secondary { background: #6b7280; }
-  .row-actions { display: flex; gap: 0.5em; margin: 0.5em 0 1.5em; }
-  .examples { font-size: 13px; color: #6b7280; margin: 0.5em 0 1.5em; }
-  .examples code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px;
-                   cursor: pointer; }
-  .status { padding: 0.8em 1em; background: #f3f4f6; border-radius: 6px;
-            margin: 1em 0; font-size: 14px; }
-  .status code { background: #e5e7eb; padding: 1px 4px; border-radius: 3px; }
-  .summary { padding: 1em; background: #eff6ff; border-left: 4px solid #2563eb;
-             border-radius: 6px; margin: 1em 0; font-weight: 500; }
-  .change { padding: 0.8em 1em; margin: 0.5em 0; border-left: 4px solid #d1d5db;
-            background: #fafafa; border-radius: 0 6px 6px 0; }
-  .change.NEW { border-color: #16a34a; background: #f0fdf4; }
-  .change.UPDATED { border-color: #ea580c; background: #fff7ed; }
-  .change.REMOVED { border-color: #dc2626; background: #fef2f2; }
-  .action { font-weight: 700; font-size: 12px; letter-spacing: 0.5px; }
-  .section { color: #6b7280; font-size: 13px; margin: 0.2em 0 0.3em; }
-  .name { font-weight: 600; }
-  .meta { font-size: 13px; color: #4b5563; margin-top: 0.3em; }
-  #spinner { display: none; padding: 2em; text-align: center; color: #6b7280; }
+  :root {
+    --bg: #f7f8fa; --card: #ffffff; --text: #111827; --muted: #6b7280;
+    --border: #e5e7eb; --accent: #2563eb; --accent-hover: #1d4ed8;
+    --danger: #dc2626; --good: #16a34a; --warn: #ea580c;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); margin: 0; padding: 2.5em 1em;
+         min-height: 100vh; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { margin: 0 0 0.2em; font-size: 28px; font-weight: 700; }
+  .subtitle { color: var(--muted); margin: 0 0 2em; }
+
+  .add-card { background: var(--card); border: 1px solid var(--border);
+              border-radius: 10px; padding: 1.25em; margin-bottom: 2em; }
+  .add-card form { display: flex; gap: 0.5em; }
+  .add-card input { flex: 1; padding: 0.7em 0.9em; font-size: 14px;
+                    border: 1px solid var(--border); border-radius: 7px; outline: none; }
+  .add-card input:focus { border-color: var(--accent); }
+  .add-card .hint { font-size: 13px; color: var(--muted); margin: 0.6em 0 0; }
+
+  button { padding: 0.7em 1.1em; font-size: 14px; font-weight: 500;
+           border: 0; border-radius: 7px; cursor: pointer; }
+  button.primary { background: var(--accent); color: white; }
+  button.primary:hover { background: var(--accent-hover); }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  button.ghost:hover { background: #f3f4f6; }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+  button.danger:hover { background: #fef2f2; border-color: var(--danger); }
+
+  .section-title { font-size: 12px; font-weight: 600; text-transform: uppercase;
+                   letter-spacing: 0.8px; color: var(--muted);
+                   margin: 0 0 0.8em; }
+
+  .track { background: var(--card); border: 1px solid var(--border);
+           border-radius: 10px; padding: 1.25em; margin-bottom: 0.8em; }
+  .track.highlight { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
+  .track h2 { margin: 0 0 0.2em; font-size: 17px; font-weight: 600; }
+  .track .plan-title { color: #374151; font-size: 13px; margin: 0 0 0.4em;
+                       line-height: 1.4; }
+  .track .url { color: var(--muted); font-size: 13px; word-break: break-all;
+                text-decoration: none; }
+  .track .url:hover { color: var(--accent); }
+  .meta { display: flex; flex-wrap: wrap; gap: 1.2em; margin: 0.8em 0;
+          font-size: 13px; color: var(--muted); }
+  .meta strong { color: var(--text); font-weight: 500; }
+  .actions { display: flex; gap: 0.4em; flex-wrap: wrap; }
+  .actions form { margin: 0; }
+
+  .empty { text-align: center; color: var(--muted); padding: 3em 1em;
+           background: var(--card); border: 1px dashed var(--border);
+           border-radius: 10px; }
+
+  .result { margin-top: 1em; padding: 0.9em 1em; border-radius: 7px; font-size: 14px; }
+  .result.info { background: #eff6ff; color: #1e3a8a; }
+  .result.ok { background: #f0fdf4; color: #14532d; }
+  .result.warn { background: #fff7ed; color: #7c2d12; }
+
+  .changes { margin-top: 0.7em; }
+  .change { padding: 0.6em 0.8em; margin: 0.3em 0; border-radius: 6px;
+            font-size: 13px; border-left: 3px solid var(--border); background: #fafafa; }
+  .change.NEW { border-color: var(--good); background: #f0fdf4; }
+  .change.UPDATED { border-color: var(--warn); background: #fff7ed; }
+  .change.REMOVED { border-color: var(--danger); background: #fef2f2; }
+  .change .tag { font-weight: 700; font-size: 11px; letter-spacing: 0.5px; }
+  .change .name { font-weight: 600; }
+  .change .diff { color: var(--muted); font-size: 12px; }
+
+  details { margin-top: 0.8em; font-size: 13px; }
+  details summary { color: var(--muted); cursor: pointer; }
+  details summary:hover { color: var(--accent); }
+  details ul { list-style: none; padding: 0; margin: 0.6em 0 0; }
+  details li { padding: 0.4em 0; border-bottom: 1px solid var(--border);
+               color: var(--muted); }
+  details li:last-child { border: 0; }
+  details li b { color: var(--text); }
+
+  #spinner { display: none; padding: 1em 0; text-align: center; color: var(--muted);
+             font-size: 15px; margin-bottom: 0.5em; }
+  #spinner-text::after { content: ''; display: inline-block; min-width: 1.5em;
+                         text-align: start; animation: dots 1.4s steps(1, end) infinite; }
+  @keyframes dots {
+    0%   { content: ''; }
+    25%  { content: '.'; }
+    50%  { content: '..'; }
+    75%  { content: '...'; }
+  }
 </style>
 </head>
 <body>
-<h1>Mavat Watch</h1>
-<p class="lead">Paste a Mavat plan URL, click <em>Check now</em>. Documents under the three accordion sections are parsed, diffed against the previous check, and any change is emailed.</p>
+<main>
+  <h1>מעקב תכניות מבאת</h1>
+  <p class="subtitle">קבלו התראה במייל כשמסמך חדש מתווסף, מוסר, או מתעדכן בתכניות שאתם עוקבים אחריהן. בדיקה אוטומטית כל דקה.</p>
 
-<form method="post" action="/check" onsubmit="document.getElementById('spinner').style.display='block'">
-  <input type="text" name="url" value="{{ url }}" required>
-  <button type="submit">Check now</button>
-</form>
+  <div id="spinner"><span id="spinner-text">טוען</span></div>
+  <script>
+    async function submitForm(form, spinnerText, confirmText) {
+      if (confirmText && !confirm(confirmText)) return false;
+      document.getElementById('spinner-text').textContent = spinnerText;
+      document.getElementById('spinner').style.display = 'block';
+      try {
+        await fetch(form.action, { method: 'POST', body: new FormData(form) });
+      } catch (e) {
+        alert('שגיאה: ' + e.message);
+      }
+      location.reload();
+      return false;
+    }
+  </script>
 
-<div class="row-actions">
-  <form method="post" action="/simulate" style="margin:0">
-    <button type="submit" class="secondary">Simulate change</button>
-  </form>
-</div>
+  <div class="add-card">
+    <p class="section-title">הוספת תכנית למעקב</p>
+    <form action="/add" onsubmit="return submitForm(this, 'מוסיף את התוכנית שלך למעקב ברגעים אלה')">
+      <button class="primary" type="submit">+ הוסף</button>
+      <input type="url" name="url" required dir="ltr"
+             placeholder="https://mavat.iplan.gov.il/SV4/1/3005115162/310"
+             pattern="https://mavat\\.iplan\\.gov\\.il/.*">
+    </form>
+    <p class="hint">המצב הנוכחי של התכנית נשמר כבסיס. כל שינוי מהרגע הזה ואילך יישלח אליכם במייל.</p>
+  </div>
 
-<p class="examples">
-  Try: <code onclick="document.querySelector('input[name=url]').value=this.innerText">https://mavat.iplan.gov.il/SV4/1/3005115162/310</code>
-</p>
+  <p class="section-title">תכניות במעקב ({{ tracks|length }})</p>
 
-<div id="spinner">Checking — usually ~30 seconds...</div>
-
-{% if last_check %}
-<div class="status">
-  Last check: <code>{{ last_check }}</code> · Stored URL: <code>{{ stored_url }}</code> · Rows on file: {{ total_rows }}
-</div>
-{% endif %}
-
-{% if message %}<div class="summary">{{ message }}</div>{% endif %}
-
-{% if result %}
-  {% if result.first_run %}
-    <div class="summary">Baseline recorded ({{ result.total_rows }} rows). The next check will diff against this.</div>
-  {% elif not result.changes %}
-    <div class="summary">No changes detected ({{ result.total_rows }} rows checked).</div>
-  {% else %}
-    <div class="summary">{{ result.changes|length }} change(s) detected</div>
-    {% for c in result.changes %}
-      <div class="change {{ c.action }}">
-        <span class="action">{{ c.action }}</span>
-        <div class="section">{{ c.section }}{% if c.category %} / {{ c.category }}{% endif %}</div>
-        <div class="name">{{ c.name }}</div>
-        <div class="meta">
-          {% if c.action == "UPDATED" %}
-            {% if c.edit_date != c.prev_edit_date %}edit_date: <s>{{ c.prev_edit_date }}</s> → <strong>{{ c.edit_date }}</strong>{% endif %}
-            {% if c.scope != c.prev_scope %}<br>scope: <s>{{ c.prev_scope }}</s> → <strong>{{ c.scope }}</strong>{% endif %}
-          {% elif c.action == "NEW" %}
-            date: {{ c.edit_date }} · scope: {{ c.scope or '—' }}
-          {% elif c.action == "REMOVED" %}
-            was: {{ c.prev_edit_date }} · {{ c.prev_scope or '—' }}
-          {% endif %}
-        </div>
-      </div>
-    {% endfor %}
-    {% if result.email_status %}<div class="status">{{ result.email_status }}</div>{% endif %}
+  {% if not tracks %}
+    <div class="empty">אין עדיין תכניות במעקב. הוסיפו אחת למעלה.</div>
   {% endif %}
-{% endif %}
+
+  {% for t in tracks %}
+    <div class="track">
+      <h2>{{ t.label }}</h2>
+      {% if t.title %}<div class="plan-title">{{ t.title }}</div>{% endif %}
+      <a class="url" href="{{ t.url }}" target="_blank" dir="ltr">{{ t.url }}</a>
+
+      <div class="meta">
+        <span>נוספה <strong>{{ t.added_at | humanize }}</strong></span>
+        <span>בדיקה אחרונה <strong>{{ t.last_check | humanize }}</strong></span>
+        <span><strong>{{ t.total_rows }}</strong> מסמכים</span>
+        <span><strong>{{ t.history_count }}</strong> שינויים תועדו</span>
+      </div>
+
+      <div class="actions">
+        <form action="/check/{{ t.id }}"
+              onsubmit="return submitForm(this, 'בודק את התכנית ברגעים אלה')">
+          <button class="primary" type="submit">בדוק עכשיו</button>
+        </form>
+        <form action="/simulate/{{ t.id }}"
+              onsubmit="return submitForm(this, 'מבצע סימולציה')">
+          <button class="ghost" type="submit" title="שינוי הבסיס באופן מלאכותי כדי שהבדיקה הבאה תדווח על שינוי לצורך הדגמה">סימולציה</button>
+        </form>
+        <form action="/remove/{{ t.id }}"
+              onsubmit="return submitForm(this, 'מסיר את התכנית מהמעקב', 'להפסיק את המעקב אחר {{ t.label }}?')">
+          <button class="danger" type="submit">הסר</button>
+        </form>
+      </div>
+
+      {% if t.history %}
+        <details>
+          <summary>יומן שינויים אחרונים ({{ t.history|length }})</summary>
+          <ul>
+            {% for h in t.history %}
+              <li><b>{{ h.action | action_he }}</b> · {{ h.name }} <span style="float:left">{{ h.ts | nice_ts }}</span></li>
+            {% endfor %}
+          </ul>
+        </details>
+      {% endif %}
+    </div>
+  {% endfor %}
+</main>
 </body></html>
 """
 
 
-def view_data(result=None, message=None, url=None):
-    state = load_state()
-    return {
-        "url": url or state.get("url", DEFAULT_URL),
-        "last_check": state.get("last_check"),
-        "stored_url": state.get("url"),
-        "total_rows": sum(len(rows) for rows in state.get("rows", {}).values()),
-        "result": result,
-        "message": message,
-    }
+def build_tracks():
+    out = []
+    for track in list_tracks():
+        url = track["url"]
+        out.append({
+            "id": url_id(url),
+            "url": url,
+            "label": nice_plan_label(url),
+            "title": track.get("plan_title", ""),
+            "added_at": track.get("added_at", track.get("last_check", "")),
+            "last_check": track.get("last_check", ""),
+            "total_rows": sum(len(rows) for rows in track.get("rows", {}).values()),
+            "history": load_history(url, limit=10),
+            "history_count": _count_history(url),
+        })
+    return out
+
+
+def _count_history(url):
+    from mavat_watch import history_file
+    path = history_file(url)
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def find_track_by_id(track_id):
+    for track in list_tracks():
+        if url_id(track["url"]) == track_id:
+            return track
+    return None
+
+
+def render():
+    return render_template_string(PAGE, tracks=build_tracks())
 
 
 @app.get("/")
 def index():
-    return render_template_string(PAGE, **view_data())
+    return render()
 
 
-@app.post("/check")
-def check():
+@app.post("/add")
+def add():
     url = request.form["url"].strip()
-    result = run_check(url)
-    result_dict = {
-        "first_run": result["first_run"],
-        "total_rows": result["total_rows"],
-        "email_status": result["email_status"],
-        "changes": [asdict(c) for c in result["changes"]],
-    }
-    return render_template_string(PAGE, **view_data(result=result_dict, url=url))
+    with check_lock:
+        add_track(url)
+    return ("", 204)
 
 
-@app.post("/simulate")
-def simulate_route():
-    if simulate():
-        msg = "Stored state tampered. Click 'Check now' to trigger a notification."
-    else:
-        msg = "No baseline yet — run a check first."
-    return render_template_string(PAGE, **view_data(message=msg))
+@app.post("/check/<track_id>")
+def check(track_id):
+    track = find_track_by_id(track_id)
+    if track:
+        with check_lock:
+            check_track(track["url"])
+    return ("", 204)
+
+
+@app.post("/simulate/<track_id>")
+def simulate(track_id):
+    track = find_track_by_id(track_id)
+    if track:
+        simulate_track(track["url"])
+    return ("", 204)
+
+
+@app.post("/remove/<track_id>")
+def remove(track_id):
+    track = find_track_by_id(track_id)
+    if track:
+        remove_track(track["url"])
+    return ("", 204)
 
 
 if __name__ == "__main__":
