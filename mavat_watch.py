@@ -610,6 +610,13 @@ def check_track(url, send_emails=True):
     snapshot = capture(url)
     current_rows = snapshot["rows"]
     previous_rows = rows_from_json(track.get("rows", {}))
+
+    for section in SECTIONS:
+        prev_section = previous_rows.get(section, [])
+        if not current_rows[section] and prev_section:
+            print(f"[check] section '{section}' returned 0 rows for {url}; preserving previous {len(prev_section)} rows", flush=True)
+            current_rows[section] = prev_section
+
     total_current = sum(len(rows) for rows in current_rows.values())
     total_previous = sum(len(rows) for rows in previous_rows.values())
 
