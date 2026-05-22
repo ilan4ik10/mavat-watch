@@ -611,6 +611,15 @@ def check_track(url, send_emails=True):
         save_track(url, track)
         return {"status": "capture_failed", "url": url, "total_rows": 0, "changes": [], "email_status": "", "files": []}
 
+    if total_previous == 0 and total_current > 0:
+        print(f"[check] previous baseline was empty for {url}; rebasing to {total_current} rows without writing history", flush=True)
+        track["last_check"] = timestamp
+        track["plan_number"] = snapshot["plan_number"] or track.get("plan_number", "")
+        track["plan_title"] = snapshot["plan_title"] or track.get("plan_title", "")
+        track["rows"] = rows_to_json(current_rows)
+        save_track(url, track)
+        return {"status": "rebased", "url": url, "total_rows": total_current, "changes": [], "email_status": "", "files": []}
+
     changes = diff_all(previous_rows, current_rows)
 
     track["last_check"] = timestamp

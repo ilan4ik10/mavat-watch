@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["playwright>=1.49", "flask>=3.0"]
+# dependencies = ["playwright>=1.49", "flask>=3.0", "psycopg[binary]>=3.1"]
 # ///
 from __future__ import annotations
 
@@ -164,6 +164,15 @@ PAGE = """<!doctype html>
     50%  { content: '..'; }
     75%  { content: '...'; }
   }
+
+  .tabs { display: flex; gap: 0.2em; margin: 0 0 1.5em; border-bottom: 1px solid var(--border); }
+  .tab-btn { padding: 0.8em 1.4em; background: transparent; border: 0;
+             border-bottom: 2px solid transparent; color: var(--muted);
+             cursor: pointer; font-size: 14px; font-weight: 500; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
 </style>
 </head>
 <body>
@@ -187,21 +196,14 @@ PAGE = """<!doctype html>
     }
   </script>
 
-  <div class="add-card">
-    <p class="section-title">הוספת תכנית למעקב</p>
-    <form method="post" action="/add" onsubmit="submitForm(this, 'מוסיף את התוכנית שלך למעקב ברגעים אלה'); return false">
-      <button class="primary" type="submit">+ הוסף</button>
-      <input type="url" name="url" required dir="ltr"
-             placeholder="https://mavat.iplan.gov.il/SV4/1/3005115162/310"
-             pattern="https://mavat\\.iplan\\.gov\\.il/.*">
-    </form>
-    <p class="hint">המצב הנוכחי של התכנית נשמר כבסיס. כל שינוי מהרגע הזה ואילך יישלח אליכם במייל.</p>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="tracked" type="button">תכניות במעקב ({{ tracks|length }})</button>
+    <button class="tab-btn" data-tab="add" type="button">הוספת תכנית</button>
   </div>
 
-  <p class="section-title">תכניות במעקב ({{ tracks|length }})</p>
-
+  <div id="tab-tracked" class="tab-panel active">
   {% if not tracks %}
-    <div class="empty">אין עדיין תכניות במעקב. הוסיפו אחת למעלה.</div>
+    <div class="empty">אין עדיין תכניות במעקב. עברו לטאב <b>הוספת תכנית</b> כדי להוסיף.</div>
   {% endif %}
 
   {% for t in tracks %}
@@ -244,6 +246,30 @@ PAGE = """<!doctype html>
       {% endif %}
     </div>
   {% endfor %}
+  </div>
+
+  <div id="tab-add" class="tab-panel">
+    <div class="add-card">
+      <p class="section-title">הוספת תכנית למעקב</p>
+      <form method="post" action="/add" onsubmit="submitForm(this, 'מוסיף את התוכנית שלך למעקב ברגעים אלה'); return false">
+        <button class="primary" type="submit">+ הוסף</button>
+        <input type="url" name="url" required dir="ltr"
+               placeholder="https://mavat.iplan.gov.il/SV4/1/3005115162/310"
+               pattern="https://mavat\\.iplan\\.gov\\.il/.*">
+      </form>
+      <p class="hint">המצב הנוכחי של התכנית נשמר כבסיס. כל שינוי מהרגע הזה ואילך יישלח אליכם במייל.</p>
+    </div>
+  </div>
+
+  <script>
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + target));
+      });
+    });
+  </script>
 </main>
 </body></html>
 """
