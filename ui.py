@@ -14,6 +14,7 @@ from flask import Flask, render_template_string, request
 from mavat_watch import (
     add_track,
     check_track,
+    history_count,
     list_tracks,
     load_history,
     load_track,
@@ -261,17 +262,9 @@ def build_tracks():
             "last_check": track.get("last_check", ""),
             "total_rows": sum(len(rows) for rows in track.get("rows", {}).values()),
             "history": load_history(url, limit=10),
-            "history_count": _count_history(url),
+            "history_count": history_count(url),
         })
     return out
-
-
-def _count_history(url):
-    from mavat_watch import history_file
-    path = history_file(url)
-    if not path.exists():
-        return 0
-    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
 def find_track_by_id(track_id):

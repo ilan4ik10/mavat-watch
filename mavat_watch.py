@@ -28,6 +28,47 @@ ACTION_COLOR = {"NEW": "#16a34a", "UPDATED": "#ea580c", "REMOVED": "#dc2626"}
 ACTION_BG = {"NEW": "#f0fdf4", "UPDATED": "#fff7ed", "REMOVED": "#fef2f2"}
 MAX_ATTACH_BYTES = 20 * 1024 * 1024
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_DB = bool(DATABASE_URL)
+
+SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS tracks (
+    url           TEXT PRIMARY KEY,
+    added_at      TEXT NOT NULL,
+    last_check    TEXT NOT NULL,
+    plan_number   TEXT NOT NULL DEFAULT '',
+    plan_title    TEXT NOT NULL DEFAULT '',
+    rows_json     JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS history (
+    id              BIGSERIAL PRIMARY KEY,
+    url             TEXT NOT NULL,
+    ts              TEXT NOT NULL,
+    section         TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    category        TEXT NOT NULL DEFAULT '',
+    scope           TEXT NOT NULL DEFAULT '',
+    edit_date       TEXT NOT NULL DEFAULT '',
+    prev_scope      TEXT NOT NULL DEFAULT '',
+    prev_edit_date  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_history_url_id ON history (url, id DESC);
+"""
+
+
+def init_db():
+    if not USE_DB:
+        return
+    import psycopg
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(SCHEMA_DDL)
+        conn.commit()
+    print(f"[db] connected, schema ready", flush=True)
+
+
+init_db()
+
 
 @dataclass(frozen=True)
 class Row:
@@ -250,6 +291,20 @@ def format_change(c):
 
 
 def load_track(url):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            row = conn.execute(
+                "SELECT url, added_at, last_check, plan_number, plan_title, rows_json FROM tracks WHERE url = %s",
+                (url,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "url": row[0], "added_at": row[1], "last_check": row[2],
+            "plan_number": row[3], "plan_title": row[4],
+            "rows": row[5] or {},
+        }
     path = state_file(url)
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -257,11 +312,43 @@ def load_track(url):
 
 
 def save_track(url, track):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                """
+                INSERT INTO tracks (url, added_at, last_check, plan_number, plan_title, rows_json)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (url) DO UPDATE SET
+                    last_check  = EXCLUDED.last_check,
+                    plan_number = EXCLUDED.plan_number,
+                    plan_title  = EXCLUDED.plan_title,
+                    rows_json   = EXCLUDED.rows_json
+                """,
+                (
+                    track["url"], track["added_at"], track["last_check"],
+                    track.get("plan_number", ""), track.get("plan_title", ""),
+                    json.dumps(track.get("rows", {}), ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        return
     TRACKS_DIR.mkdir(parents=True, exist_ok=True)
     state_file(url).write_text(json.dumps(track, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def list_tracks():
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT url, added_at, last_check, plan_number, plan_title, rows_json FROM tracks ORDER BY added_at"
+            ).fetchall()
+        return [
+            {"url": r[0], "added_at": r[1], "last_check": r[2],
+             "plan_number": r[3], "plan_title": r[4], "rows": r[5] or {}}
+            for r in rows
+        ]
     if not TRACKS_DIR.exists():
         return []
     items = []
@@ -274,6 +361,14 @@ def list_tracks():
 
 
 def remove_track(url):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute("DELETE FROM history WHERE url = %s", (url,))
+            cur = conn.execute("DELETE FROM tracks WHERE url = %s", (url,))
+            removed = cur.rowcount > 0
+            conn.commit()
+        return removed
     path = state_file(url)
     if not path.exists():
         return False
@@ -285,6 +380,21 @@ def remove_track(url):
 
 
 def append_history(url, timestamp, changes):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            for c in changes:
+                conn.execute(
+                    """
+                    INSERT INTO history
+                      (url, ts, section, action, name, category, scope, edit_date, prev_scope, prev_edit_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (url, timestamp, c.section, c.action, c.name, c.category,
+                     c.scope, c.edit_date, c.prev_scope, c.prev_edit_date),
+                )
+            conn.commit()
+        return
     TRACKS_DIR.mkdir(parents=True, exist_ok=True)
     with history_file(url).open("a", encoding="utf-8") as f:
         for change in changes:
@@ -292,11 +402,38 @@ def append_history(url, timestamp, changes):
 
 
 def load_history(url, limit=20):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, section, action, name, category, scope, edit_date, prev_scope, prev_edit_date
+                FROM history WHERE url = %s ORDER BY id DESC LIMIT %s
+                """,
+                (url, limit),
+            ).fetchall()
+        return [
+            {"ts": r[0], "section": r[1], "action": r[2], "name": r[3], "category": r[4],
+             "scope": r[5], "edit_date": r[6], "prev_scope": r[7], "prev_edit_date": r[8]}
+            for r in rows
+        ]
     path = history_file(url)
     if not path.exists():
         return []
     lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     return [json.loads(l) for l in lines[-limit:][::-1]]
+
+
+def history_count(url):
+    if USE_DB:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            n = conn.execute("SELECT COUNT(*) FROM history WHERE url = %s", (url,)).fetchone()[0]
+        return n
+    path = history_file(url)
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
 def download_changed_files(url, changes):
