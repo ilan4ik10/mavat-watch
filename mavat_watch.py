@@ -728,8 +728,8 @@ def build_email_html(changes, url, files):
 <html lang="he" dir="rtl">
 <body style="margin:0;padding:24px;background:#f7f8fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111827;direction:rtl;text-align:right">
   <div dir="rtl" style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb;direction:rtl;text-align:right;unicode-bidi:isolate">
-    <div style="font-size:12px;color:#6b7280;direction:rtl;text-align:right">{plan_label(url)}</div>
-    <div style="font-size:20px;font-weight:700;margin:4px 0 18px;direction:rtl;text-align:right">זוהו {len(changes)} שינויים</div>
+    <div style="font-size:22px;font-weight:700;color:#111827;direction:rtl;text-align:right">{plan_label(url)}</div>
+    <div style="font-size:14px;color:#6b7280;margin:4px 0 18px;direction:rtl;text-align:right">זוהו {len(changes)} שינויים</div>
     {''.join(cards)}
     <a href="{url}" style="display:inline-block;margin-top:14px;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;font-size:14px;font-weight:500;border-radius:6px;direction:rtl">פתח את עמוד התכנית</a>
   </div>
@@ -751,10 +751,11 @@ def build_email_plain(changes, url):
 
 
 def build_email_subject(changes, url):
+    label = plan_label(url)
     if len(changes) == 1:
         c = changes[0]
-        return f"[מבאת] {ACTION_LABEL_HE[c.action]}: {c.name[:60]}"
-    return f"[מבאת] {len(changes)} שינויים · {plan_label(url)}"
+        return f"[מבאת] {label} · {ACTION_LABEL_HE[c.action]}: {c.name[:60]}"
+    return f"[מבאת] {label} · {len(changes)} שינויים"
 
 
 def send_email(changes, url, files=None):
