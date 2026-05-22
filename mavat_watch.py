@@ -182,7 +182,15 @@ def capture(url):
             locale="he-IL", viewport={"width": 1500, "height": 1100},
         ).new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(6_000)
+        try:
+            page.wait_for_selector("h1.plan-name", timeout=20_000)
+        except PWTimeout:
+            pass
+        try:
+            page.wait_for_selector("ul.uk-accordion", timeout=20_000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(1_500)
         try:
             info = page.evaluate(EXTRACT_PLAN_INFO_JS)
             plan_number = info.get("number", "") or ""
