@@ -9,9 +9,11 @@ import argparse
 import json
 import mimetypes
 import os
+import queue
 import re
 import smtplib
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from email.message import EmailMessage
@@ -108,6 +110,87 @@ EXTRACT_ROWS_JS = r"""
 """
 
 
+OPEN_ALL_SECTIONS_JS = r"""
+(sections) => {
+    document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
+        const title = li.querySelector(':scope > .uk-accordion-title');
+        if (!title) return;
+        const text = (title.innerText || '').trim();
+        if (sections.some(s => text.includes(s)) && !li.classList.contains('uk-open')) {
+            title.click();
+        }
+    });
+}
+"""
+
+
+WAIT_ALL_OPEN_JS = r"""
+(sections) => {
+    let opened = 0;
+    document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
+        const title = li.querySelector(':scope > .uk-accordion-title');
+        if (!title) return;
+        const text = (title.innerText || '').trim();
+        if (sections.some(s => text.includes(s))) {
+            const content = li.querySelector(':scope > .uk-accordion-content');
+            if (li.classList.contains('uk-open') && content && content.children.length > 0) opened++;
+        }
+    });
+    return opened === sections.length;
+}
+"""
+
+
+EXPAND_NESTED_JS = r"""
+() => {
+    let n = 0;
+    document.querySelectorAll('li.uk-open .uk-accordion-content li:not(.uk-open) > .uk-accordion-title')
+        .forEach(t => {
+            const r = t.getBoundingClientRect();
+            if (r.width > 0 || r.height > 0) { t.click(); n++; }
+        });
+    return n;
+}
+"""
+
+
+EXTRACT_ALL_ROWS_JS = r"""
+(sections) => {
+    const result = {};
+    document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
+        const title = li.querySelector(':scope > .uk-accordion-title');
+        if (!title) return;
+        const text = (title.innerText || '').trim();
+        const match = sections.find(s => text.includes(s));
+        if (!match) return;
+        const panel = li.querySelector(':scope > .uk-accordion-content');
+        if (!panel) { result[match] = []; return; }
+        const rows = [];
+        let category = '';
+        panel.querySelectorAll('.uk-grid').forEach(grid => {
+            const lead = grid.querySelector(':scope > .uk-text-lead');
+            if (lead) category = (lead.innerText || '').trim();
+            if (grid.classList.contains('sv4-headline')) return;
+            const cells = [...grid.children];
+            const dateCell = cells.find(c => /\bli-date\b/.test(c.className || ''));
+            if (!dateCell) return;
+            const nameCell = cells.find(c => /uk-width-expand|widthTitle/.test(c.className || ''));
+            const scopeCell = cells.find(c =>
+                /\bli-file\b/.test(c.className || '') && !/\bli-date\b/.test(c.className || ''));
+            rows.push({
+                category,
+                name: nameCell ? (nameCell.innerText || '').trim().replace(/\s+/g, ' ') : '',
+                scope: scopeCell ? (scopeCell.innerText || '').trim() : '',
+                edit_date: (dateCell.innerText || '').trim(),
+            });
+        });
+        result[match] = rows;
+    });
+    return result;
+}
+"""
+
+
 def url_id(url):
     match = re.search(r"/SV4/\d+/(\d+)(?:/(\d+))?", url)
     if match:
@@ -172,46 +255,121 @@ EXTRACT_PLAN_INFO_JS = r"""
 """
 
 
-def capture(url):
+def _do_capture(page, url):
     rows = {section: [] for section in SECTIONS}
     plan_number = ""
     plan_title = ""
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_context(
-            locale="he-IL", viewport={"width": 1500, "height": 1100},
-        ).new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    for sel in ("h1.plan-name", "ul.uk-accordion"):
         try:
-            page.wait_for_selector("h1.plan-name", timeout=20_000)
+            page.wait_for_selector(sel, timeout=20_000)
         except PWTimeout:
             pass
+    page.wait_for_timeout(800)
+
+    try:
+        info = page.evaluate(EXTRACT_PLAN_INFO_JS)
+        plan_number = info.get("number", "") or ""
+        plan_title = info.get("title", "") or ""
+    except Exception:
+        pass
+
+    try:
+        page.evaluate(OPEN_ALL_SECTIONS_JS, SECTIONS)
+    except Exception:
+        pass
+    try:
+        page.wait_for_function(WAIT_ALL_OPEN_JS, arg=SECTIONS, timeout=15_000)
+    except PWTimeout:
+        pass
+
+    for _ in range(8):
         try:
-            page.wait_for_selector("ul.uk-accordion", timeout=20_000)
-        except PWTimeout:
-            pass
-        page.wait_for_timeout(1_500)
-        try:
-            info = page.evaluate(EXTRACT_PLAN_INFO_JS)
-            plan_number = info.get("number", "") or ""
-            plan_title = info.get("title", "") or ""
+            clicked = page.evaluate(EXPAND_NESTED_JS)
         except Exception:
-            pass
-        for label in SECTIONS:
-            try:
-                section = open_section(page, label)
-                panel = section.locator(".uk-accordion-content").first
-                expand_nested_accordions(panel, page)
-                page.wait_for_timeout(800)
-                raw_rows = panel.evaluate(EXTRACT_ROWS_JS)
-                rows[label] = [
-                    Row(section=label, **{k: r[k] for k in ("category", "name", "scope", "edit_date")})
-                    for r in raw_rows if r["name"]
-                ]
-            except (PWTimeout, Exception):
-                rows[label] = []
-        browser.close()
+            clicked = 0
+        if not clicked:
+            break
+        page.wait_for_timeout(400)
+    page.wait_for_timeout(500)
+
+    try:
+        all_data = page.evaluate(EXTRACT_ALL_ROWS_JS, SECTIONS)
+    except Exception:
+        all_data = {}
+    for label in SECTIONS:
+        for r in all_data.get(label, []):
+            if r.get("name"):
+                rows[label].append(Row(
+                    section=label, category=r["category"], name=r["name"],
+                    scope=r["scope"], edit_date=r["edit_date"],
+                ))
+
     return {"rows": rows, "plan_number": plan_number, "plan_title": plan_title}
+
+
+_capture_queue: queue.Queue = queue.Queue()
+_capture_worker_started = False
+
+
+def _capture_worker():
+    print("[browser] starting capture worker", flush=True)
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        print("[browser] capture worker ready", flush=True)
+    except Exception as exc:
+        print(f"[browser] worker failed to start: {type(exc).__name__}: {exc}", flush=True)
+        return
+
+    while True:
+        url, result_q = _capture_queue.get()
+        if url is None:
+            break
+        try:
+            ctx = browser.new_context(locale="he-IL", viewport={"width": 1500, "height": 1100})
+            page = ctx.new_page()
+            try:
+                result = _do_capture(page, url)
+                result_q.put(("ok", result))
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            result_q.put(("err", exc))
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                browser = pw.chromium.launch(headless=True)
+                print("[browser] worker restarted browser after error", flush=True)
+            except Exception as exc2:
+                print(f"[browser] restart failed: {exc2}", flush=True)
+                return
+
+
+def _ensure_capture_worker():
+    global _capture_worker_started
+    if not _capture_worker_started:
+        _capture_worker_started = True
+        threading.Thread(target=_capture_worker, daemon=True).start()
+
+
+def capture(url):
+    _ensure_capture_worker()
+    result_q: queue.Queue = queue.Queue()
+    _capture_queue.put((url, result_q))
+    status, payload = result_q.get(timeout=180)
+    if status == "err":
+        raise payload
+    return payload
+
+
+_ensure_capture_worker()
 
 
 def rows_to_json(rows_by_section):
