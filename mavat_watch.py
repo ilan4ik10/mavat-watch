@@ -272,15 +272,17 @@ def _do_capture(page, url):
     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     t = _step("goto + domcontentloaded", t)
 
-    for sel in ("h1.plan-name", "ul.uk-accordion"):
-        try:
-            page.wait_for_selector(sel, timeout=20_000)
-            t = _step(f"wait_for_selector {sel}", t)
-        except PWTimeout:
-            t = _step(f"wait_for_selector {sel} TIMEOUT", t)
+    try:
+        page.wait_for_function(
+            "() => !!document.querySelector('h1.plan-name') && !!document.querySelector('ul.uk-accordion > li')",
+            timeout=60_000,
+        )
+        t = _step("wait for h1 + accordion (combined)", t)
+    except PWTimeout:
+        t = _step("wait for h1 + accordion (combined) TIMEOUT", t)
 
-    page.wait_for_timeout(800)
-    t = _step("settle 800ms", t)
+    page.wait_for_timeout(300)
+    t = _step("settle 300ms", t)
 
     try:
         info = page.evaluate(EXTRACT_PLAN_INFO_JS)
@@ -342,6 +344,22 @@ _capture_queue: queue.Queue = queue.Queue()
 _capture_worker_started = False
 
 
+def _new_ctx(browser):
+    return browser.new_context(locale="he-IL", viewport={"width": 1500, "height": 1100})
+
+
+def _prewarm_mavat(ctx):
+    try:
+        t = time.perf_counter()
+        wp = ctx.new_page()
+        wp.goto("https://mavat.iplan.gov.il/", wait_until="domcontentloaded", timeout=60_000)
+        wp.wait_for_timeout(3_000)
+        wp.close()
+        _step("prewarm mavat homepage", t)
+    except Exception as exc:
+        print(f"[browser] prewarm failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 def _capture_worker():
     print("[browser] starting capture worker", flush=True)
     try:
@@ -350,6 +368,9 @@ def _capture_worker():
         t = _step("sync_playwright().start()", t)
         browser = pw.chromium.launch(headless=True)
         t = _step("chromium.launch()", t)
+        ctx = _new_ctx(browser)
+        t = _step("shared context", t)
+        _prewarm_mavat(ctx)
         print("[browser] capture worker ready", flush=True)
     except Exception as exc:
         print(f"[browser] worker failed to start: {type(exc).__name__}: {exc}", flush=True)
@@ -360,29 +381,33 @@ def _capture_worker():
         if url is None:
             break
         try:
-            ctx_t = time.perf_counter()
-            ctx = browser.new_context(locale="he-IL", viewport={"width": 1500, "height": 1100})
+            p_t = time.perf_counter()
             page = ctx.new_page()
-            _step("new_context + new_page", ctx_t)
+            _step("new_page (shared ctx)", p_t)
             try:
                 result = _do_capture(page, url)
                 result_q.put(("ok", result))
             finally:
                 close_t = time.perf_counter()
                 try:
-                    ctx.close()
+                    page.close()
                 except Exception:
                     pass
-                _step("ctx.close()", close_t)
+                _step("page.close()", close_t)
         except Exception as exc:
             result_q.put(("err", exc))
+            try:
+                ctx.close()
+            except Exception:
+                pass
             try:
                 browser.close()
             except Exception:
                 pass
             try:
                 browser = pw.chromium.launch(headless=True)
-                print("[browser] worker restarted browser after error", flush=True)
+                ctx = _new_ctx(browser)
+                print("[browser] worker restarted browser+context after error", flush=True)
             except Exception as exc2:
                 print(f"[browser] restart failed: {exc2}", flush=True)
                 return
