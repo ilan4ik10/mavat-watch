@@ -14,6 +14,7 @@ import re
 import smtplib
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from email.message import EmailMessage
@@ -22,6 +23,11 @@ from pathlib import Path
 import psycopg
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
+
+
+def _step(label, t0):
+    print(f"[time] {label}: {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+    return time.perf_counter()
 
 SECTIONS = ["מסמכי התכנית", "מסמכי מידע מנהלי", "נוסחי פרסום"]
 FILES_DIR = Path.home() / ".cache" / "mavat-watch" / "files"
@@ -256,17 +262,25 @@ EXTRACT_PLAN_INFO_JS = r"""
 
 
 def _do_capture(page, url):
+    print(f"[time] === capture start: {url} ===", flush=True)
+    start = time.perf_counter()
+    t = start
     rows = {section: [] for section in SECTIONS}
     plan_number = ""
     plan_title = ""
 
     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    t = _step("goto + domcontentloaded", t)
+
     for sel in ("h1.plan-name", "ul.uk-accordion"):
         try:
             page.wait_for_selector(sel, timeout=20_000)
+            t = _step(f"wait_for_selector {sel}", t)
         except PWTimeout:
-            pass
+            t = _step(f"wait_for_selector {sel} TIMEOUT", t)
+
     page.wait_for_timeout(800)
+    t = _step("settle 800ms", t)
 
     try:
         info = page.evaluate(EXTRACT_PLAN_INFO_JS)
@@ -274,16 +288,22 @@ def _do_capture(page, url):
         plan_title = info.get("title", "") or ""
     except Exception:
         pass
+    t = _step(f"extract plan info (number={plan_number!r})", t)
 
     try:
         page.evaluate(OPEN_ALL_SECTIONS_JS, SECTIONS)
     except Exception:
         pass
+    t = _step("click all 3 sections", t)
+
     try:
         page.wait_for_function(WAIT_ALL_OPEN_JS, arg=SECTIONS, timeout=15_000)
+        t = _step("wait for all 3 sections open", t)
     except PWTimeout:
-        pass
+        t = _step("wait for all 3 sections open TIMEOUT", t)
 
+    expand_iters = 0
+    expand_clicks = 0
     for _ in range(8):
         try:
             clicked = page.evaluate(EXPAND_NESTED_JS)
@@ -291,8 +311,13 @@ def _do_capture(page, url):
             clicked = 0
         if not clicked:
             break
+        expand_iters += 1
+        expand_clicks += clicked
         page.wait_for_timeout(400)
+    t = _step(f"expand nested ({expand_iters} iters, {expand_clicks} clicks)", t)
+
     page.wait_for_timeout(500)
+    t = _step("final settle 500ms", t)
 
     try:
         all_data = page.evaluate(EXTRACT_ALL_ROWS_JS, SECTIONS)
@@ -305,7 +330,11 @@ def _do_capture(page, url):
                     section=label, category=r["category"], name=r["name"],
                     scope=r["scope"], edit_date=r["edit_date"],
                 ))
+    counts = {label: len(rows[label]) for label in SECTIONS}
+    t = _step(f"extract all rows {counts}", t)
 
+    total_ms = (time.perf_counter() - start) * 1000
+    print(f"[time] === capture done in {total_ms:.0f} ms ===", flush=True)
     return {"rows": rows, "plan_number": plan_number, "plan_title": plan_title}
 
 
@@ -316,8 +345,11 @@ _capture_worker_started = False
 def _capture_worker():
     print("[browser] starting capture worker", flush=True)
     try:
+        t = time.perf_counter()
         pw = sync_playwright().start()
+        t = _step("sync_playwright().start()", t)
         browser = pw.chromium.launch(headless=True)
+        t = _step("chromium.launch()", t)
         print("[browser] capture worker ready", flush=True)
     except Exception as exc:
         print(f"[browser] worker failed to start: {type(exc).__name__}: {exc}", flush=True)
@@ -328,16 +360,20 @@ def _capture_worker():
         if url is None:
             break
         try:
+            ctx_t = time.perf_counter()
             ctx = browser.new_context(locale="he-IL", viewport={"width": 1500, "height": 1100})
             page = ctx.new_page()
+            _step("new_context + new_page", ctx_t)
             try:
                 result = _do_capture(page, url)
                 result_q.put(("ok", result))
             finally:
+                close_t = time.perf_counter()
                 try:
                     ctx.close()
                 except Exception:
                     pass
+                _step("ctx.close()", close_t)
         except Exception as exc:
             result_q.put(("err", exc))
             try:
@@ -361,9 +397,11 @@ def _ensure_capture_worker():
 
 def capture(url):
     _ensure_capture_worker()
+    enq_t = time.perf_counter()
     result_q: queue.Queue = queue.Queue()
     _capture_queue.put((url, result_q))
     status, payload = result_q.get(timeout=180)
+    _step("capture() incl. queue wait", enq_t)
     if status == "err":
         raise payload
     return payload
@@ -740,10 +778,16 @@ def send_email(changes, url, files=None):
 
 
 def add_track(url):
+    add_t = time.perf_counter()
+    print(f"[time] === add_track start: {url} ===", flush=True)
+    t = add_t
     if load_track(url):
+        _step("load_track (exists check)", t)
         return {"status": "exists", "url": url}
+    t = _step("load_track (exists check)", t)
     timestamp = datetime.now().isoformat(timespec="seconds")
     snapshot = capture(url)
+    t = _step("add_track: capture() returned", t)
     rows = snapshot["rows"]
     total = sum(len(v) for v in rows.values())
     if total == 0:
@@ -757,6 +801,9 @@ def add_track(url):
         "plan_title": snapshot["plan_title"],
         "rows": rows_to_json(rows),
     })
+    _step("save_track", t)
+    total_ms = (time.perf_counter() - add_t) * 1000
+    print(f"[time] === add_track done in {total_ms:.0f} ms ===", flush=True)
     return {"status": "added", "url": url, "total_rows": total}
 
 
