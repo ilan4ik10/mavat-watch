@@ -18,7 +18,7 @@ from mavat_watch import (
     list_tracks,
     load_history,
     load_track,
-    nice_plan_label,
+    plan_label,
     remove_track,
     simulate_track,
     url_id,
@@ -256,7 +256,7 @@ def build_tracks():
         out.append({
             "id": url_id(url),
             "url": url,
-            "label": nice_plan_label(url),
+            "label": plan_label(url),
             "title": track.get("plan_title", ""),
             "added_at": track.get("added_at", track.get("last_check", "")),
             "last_check": track.get("last_check", ""),

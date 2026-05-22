@@ -116,17 +116,10 @@ def url_id(url):
 
 
 def plan_label(url):
-    match = re.search(r"/SV4/\d+/(\d+)(?:/(\d+))?", url)
-    if match:
-        return f"תוכנית {match.group(1)} · סוג {match.group(2) or '—'}"
-    return url
-
-
-def nice_plan_label(url):
     track = load_track(url)
     if track and track.get("plan_number"):
         return f"תוכנית {track['plan_number']}"
-    return plan_label(url)
+    return "תוכנית (טוען…)"
 
 
 def open_section(page, label):
@@ -506,7 +499,7 @@ def build_email_html(changes, url, files):
 <html lang="he" dir="rtl">
 <body style="margin:0;padding:24px;background:#f7f8fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111827;direction:rtl;text-align:right">
   <div dir="rtl" style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb;direction:rtl;text-align:right;unicode-bidi:isolate">
-    <div style="font-size:12px;color:#6b7280;direction:rtl;text-align:right">{nice_plan_label(url)}</div>
+    <div style="font-size:12px;color:#6b7280;direction:rtl;text-align:right">{plan_label(url)}</div>
     <div style="font-size:20px;font-weight:700;margin:4px 0 18px;direction:rtl;text-align:right">זוהו {len(changes)} שינויים</div>
     {''.join(cards)}
     <a href="{url}" style="display:inline-block;margin-top:14px;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;font-size:14px;font-weight:500;border-radius:6px;direction:rtl">פתח את עמוד התכנית</a>
@@ -516,7 +509,7 @@ def build_email_html(changes, url, files):
 
 
 def build_email_plain(changes, url):
-    lines = [f"זוהו {len(changes)} שינויים בתכנית {nice_plan_label(url)}", ""]
+    lines = [f"זוהו {len(changes)} שינויים בתכנית {plan_label(url)}", ""]
     for c in changes:
         lines.append(f"• [{ACTION_LABEL_HE[c.action]}] {c.name}")
         if c.action == "UPDATED" and c.edit_date != c.prev_edit_date:
@@ -532,7 +525,7 @@ def build_email_subject(changes, url):
     if len(changes) == 1:
         c = changes[0]
         return f"[מבאת] {ACTION_LABEL_HE[c.action]}: {c.name[:60]}"
-    return f"[מבאת] {len(changes)} שינויים · {nice_plan_label(url)}"
+    return f"[מבאת] {len(changes)} שינויים · {plan_label(url)}"
 
 
 def send_email(changes, url, files=None):
@@ -586,6 +579,10 @@ def add_track(url):
     timestamp = datetime.now().isoformat(timespec="seconds")
     snapshot = capture(url)
     rows = snapshot["rows"]
+    total = sum(len(v) for v in rows.values())
+    if total == 0:
+        print(f"[add] refusing to save empty baseline for {url}", flush=True)
+        return {"status": "capture_failed", "url": url, "total_rows": 0}
     save_track(url, {
         "url": url,
         "added_at": timestamp,
@@ -594,7 +591,7 @@ def add_track(url):
         "plan_title": snapshot["plan_title"],
         "rows": rows_to_json(rows),
     })
-    return {"status": "added", "url": url, "total_rows": sum(len(v) for v in rows.values())}
+    return {"status": "added", "url": url, "total_rows": total}
 
 
 def check_track(url, send_emails=True):
@@ -605,6 +602,15 @@ def check_track(url, send_emails=True):
     snapshot = capture(url)
     current_rows = snapshot["rows"]
     previous_rows = rows_from_json(track.get("rows", {}))
+    total_current = sum(len(rows) for rows in current_rows.values())
+    total_previous = sum(len(rows) for rows in previous_rows.values())
+
+    if total_current == 0 and total_previous > 0:
+        print(f"[check] capture returned 0 rows for {url} but previous had {total_previous}; treating as failure", flush=True)
+        track["last_check"] = timestamp
+        save_track(url, track)
+        return {"status": "capture_failed", "url": url, "total_rows": 0, "changes": [], "email_status": "", "files": []}
+
     changes = diff_all(previous_rows, current_rows)
 
     track["last_check"] = timestamp
@@ -624,7 +630,7 @@ def check_track(url, send_emails=True):
     return {
         "status": "checked",
         "url": url,
-        "total_rows": sum(len(rows) for rows in current_rows.values()),
+        "total_rows": total_current,
         "changes": changes,
         "email_status": email_status,
         "files": files,
@@ -674,7 +680,7 @@ def main():
             print("no tracked URLs")
             return 0
         for track in tracks:
-            print(f"- {nice_plan_label(track['url'])}  ({track['url']})")
+            print(f"- {plan_label(track['url'])}  ({track['url']})")
             print(f"    added {track['added_at']}, last check {track['last_check']}")
         return 0
 
@@ -683,19 +689,19 @@ def main():
         if result["status"] == "exists":
             print(f"already tracking {args.url}")
         else:
-            print(f"added {nice_plan_label(args.url)} with {result['total_rows']} docs as baseline")
+            print(f"added {plan_label(args.url)} with {result['total_rows']} docs as baseline")
         return 0
 
     if args.cmd == "remove":
         if remove_track(args.url):
-            print(f"removed {nice_plan_label(args.url)}")
+            print(f"removed {plan_label(args.url)}")
             return 0
         print(f"not tracked: {args.url}")
         return 1
 
     if args.cmd == "simulate":
         if simulate_track(args.url):
-            print(f"tampered baseline for {nice_plan_label(args.url)}; next check will report changes")
+            print(f"tampered baseline for {plan_label(args.url)}; next check will report changes")
             return 0
         print(f"not tracked: {args.url}")
         return 1
@@ -717,7 +723,7 @@ def print_check_result(result):
     if result["status"] == "not_tracked":
         print(f"not tracked: {result['url']}")
         return
-    label = nice_plan_label(result["url"])
+    label = plan_label(result["url"])
     if not result["changes"]:
         print(f"{label}: no changes ({result['total_rows']} docs)")
         return

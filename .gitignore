@@ -5,3 +5,7 @@ __pycache__/
 .vscode/
 .DS_Store
 *.egg-info/
+
+# local-only secrets — never commit
+run-local.sh
+.env
