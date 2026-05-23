@@ -993,10 +993,11 @@ def simulate_track(url, fake_date="01/01/1900"):
 
 
 def simulate_pdf_change(url):
-    """For demos: change a numeric value in the most-recently-saved PDF for
-    this URL, then call simulate_track() so the next check fires an UPDATED
-    event. After the next check, the new (real) download differs from the
-    modified saved file, producing a visible highlight diff."""
+    """For demos: change a numeric value in a saved PDF for this URL, then
+    call simulate_track() so the next check fires an UPDATED event. After
+    the next check, the new (real) download differs from the modified saved
+    file, producing a visible highlight diff. Tries PDFs newest-first until
+    one mutates successfully (image-only blueprints have no mutable text)."""
     out_dir = FILES_DIR / url_id(url)
     if not out_dir.exists():
         return False
@@ -1005,11 +1006,12 @@ def simulate_pdf_change(url):
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not pdfs:
-        return False
-    if not mutate_one_number(pdfs[0]):
-        return False
-    return simulate_track(url)
+    for pdf in pdfs:
+        if mutate_one_number(pdf):
+            print(f"[simulate-pdf] mutated {pdf.name}", flush=True)
+            return simulate_track(url)
+    print(f"[simulate-pdf] tried {len(pdfs)} PDF(s) for {url}, none mutable", flush=True)
+    return False
 
 
 def check_all(send_emails=True):
