@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["playwright>=1.49"]
+# dependencies = ["playwright>=1.49", "pymupdf>=1.27"]
 # ///
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from pathlib import Path
 import psycopg
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
+
+from pdfdiff import make_highlighted_pdf, mutate_one_number
 
 
 def _step(label, t0):
@@ -588,6 +590,14 @@ def history_count(url):
         return conn.execute("SELECT COUNT(*) FROM history WHERE url = %s", (url,)).fetchone()[0]
 
 
+def _find_previous_version(out_dir, suggested, exclude):
+    candidates = [p for p in out_dir.iterdir()
+                  if p.is_file() and p != exclude and p.name.endswith("_" + suggested)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 def download_changed_files(url, changes):
     targets = [c for c in changes if c.action in ("NEW", "UPDATED")]
     print(f"[download] {len(targets)} target(s) to download from {url}", flush=True)
@@ -669,6 +679,22 @@ def download_changed_files(url, changes):
                 entry["filename"] = suggested
                 entry["size"] = size
                 print(f"[download]   ✓ saved {suggested} ({size} bytes) -> {target}", flush=True)
+                if change.action == "UPDATED" and target.suffix.lower() == ".pdf":
+                    prev = _find_previous_version(out_dir, suggested, target)
+                    if prev:
+                        stem = target.stem
+                        hl_target = out_dir / f"{stem}-highlighted.pdf"
+                        try:
+                            n = make_highlighted_pdf(prev, target, hl_target)
+                            if n > 0:
+                                entry["highlighted_path"] = str(hl_target)
+                                entry["highlighted_filename"] = f"{Path(suggested).stem}-highlighted.pdf"
+                                entry["highlighted_size"] = hl_target.stat().st_size
+                                print(f"[download]   ✓ highlighted {n} change(s) vs {prev.name} -> {hl_target}", flush=True)
+                            else:
+                                print(f"[download]   no text-level diff vs {prev.name}", flush=True)
+                        except Exception as exc:
+                            print(f"[download]   pdfdiff failed: {type(exc).__name__}: {exc}", flush=True)
             except Exception as exc:
                 entry["error"] = f"{type(exc).__name__}: {exc}"
                 print(f"[download]   ✗ {type(exc).__name__}: {exc}", flush=True)
@@ -712,6 +738,8 @@ def build_email_html(changes, url, files):
                     file_line = f'<div style="font-size:12px;color:#6b7280;margin-top:8px">📎 הקובץ גדול מדי לצירוף ({f["size"] // 1024 // 1024} MB) — שמור מקומית.</div>'
                 else:
                     file_line = f'<div style="font-size:12px;color:#6b7280;margin-top:8px">📎 מצורף: {f["filename"]}</div>'
+                    if f.get("highlighted_filename") and f.get("highlighted_size", 0) <= MAX_ATTACH_BYTES:
+                        file_line += f'<div style="font-size:12px;color:#16a34a;margin-top:4px">🟢 שינויים מודגשים: {f["highlighted_filename"]}</div>'
             elif "error" in f:
                 file_line = '<div style="font-size:12px;color:#9ca3af;margin-top:8px">⚠️ לא ניתן להוריד את הקובץ אוטומטית.</div>'
 
@@ -758,6 +786,54 @@ def build_email_subject(changes, url):
     return f"[מבאת] {label} · {len(changes)} שינויים"
 
 
+def send_whatsapp(changes, url):
+    import urllib.request
+    token = os.environ.get("WHAPI_TOKEN")
+    to = os.environ.get("WHAPI_TO")
+    if not token or not to:
+        return "whatsapp דולג: WHAPI_TOKEN / WHAPI_TO לא הוגדרו"
+
+    label = plan_label(url)
+    lines = [f"📋 {label}", f"זוהו {len(changes)} שינויים", ""]
+    for c in changes:
+        tag = ACTION_LABEL_HE[c.action]
+        line = f"• [{tag}] {c.name}"
+        if c.action == "UPDATED" and c.edit_date != c.prev_edit_date:
+            line += f" — תאריך עריכה: {c.prev_edit_date} → {c.edit_date}"
+        elif c.action == "NEW":
+            line += f" — תאריך עריכה: {c.edit_date}"
+        lines.append(line)
+    lines.append("")
+    lines.append(url)
+    body = "\n".join(lines)
+
+    payload = json.dumps({"to": to, "body": body}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://gate.whapi.cloud/messages/text",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "mavat-watch/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+        return f"whatsapp נשלח אל {to}"
+    except urllib.error.HTTPError as exc:
+        try:
+            body_bytes = exc.read()
+            err_body = body_bytes.decode("utf-8", errors="replace")[:200]
+        except Exception:
+            err_body = ""
+        return f"whatsapp נכשל: HTTP {exc.code} — {err_body}"
+    except Exception as exc:
+        return f"whatsapp נכשל: {type(exc).__name__}: {exc}"
+
+
 def send_email(changes, url, files=None):
     user = os.environ.get("MAVAT_GMAIL_USER")
     password = os.environ.get("MAVAT_GMAIL_PASS")
@@ -776,20 +852,25 @@ def send_email(changes, url, files=None):
     print(f"[email] received {len(files)} file record(s) from downloader", flush=True)
     attached = 0
     for f in files:
-        path = f.get("path")
-        if not path:
-            print(f"[email]   skip (no path): {f.get('name')} — {f.get('error', 'unknown')}", flush=True)
-            continue
-        size = f.get("size", 0)
-        if size > MAX_ATTACH_BYTES:
-            print(f"[email]   skip (too large, {size} bytes > {MAX_ATTACH_BYTES}): {f['filename']}", flush=True)
-            continue
-        mime, _ = mimetypes.guess_type(f["filename"])
-        maintype, subtype = (mime.split("/", 1) if mime else ("application", "octet-stream"))
-        with open(path, "rb") as fh:
-            message.add_attachment(fh.read(), maintype=maintype, subtype=subtype, filename=f["filename"])
-        attached += 1
-        print(f"[email]   attached {f['filename']} ({size} bytes, {maintype}/{subtype})", flush=True)
+        for path_key, name_key, size_key in (
+            ("path", "filename", "size"),
+            ("highlighted_path", "highlighted_filename", "highlighted_size"),
+        ):
+            path = f.get(path_key)
+            if not path:
+                if path_key == "path":
+                    print(f"[email]   skip (no path): {f.get('name')} — {f.get('error', 'unknown')}", flush=True)
+                continue
+            size = f.get(size_key, 0)
+            if size > MAX_ATTACH_BYTES:
+                print(f"[email]   skip (too large, {size} bytes > {MAX_ATTACH_BYTES}): {f[name_key]}", flush=True)
+                continue
+            mime, _ = mimetypes.guess_type(f[name_key])
+            maintype, subtype = (mime.split("/", 1) if mime else ("application", "octet-stream"))
+            with open(path, "rb") as fh:
+                message.add_attachment(fh.read(), maintype=maintype, subtype=subtype, filename=f[name_key])
+            attached += 1
+            print(f"[email]   attached {f[name_key]} ({size} bytes, {maintype}/{subtype})", flush=True)
     print(f"[email] {attached} attachment(s) added to message", flush=True)
 
     try:
@@ -875,12 +956,15 @@ def check_track(url, send_emails=True):
     save_track(url, track)
 
     email_status = ""
+    whatsapp_status = ""
     files = []
     if changes:
         append_history(url, timestamp, changes)
         if send_emails:
             files = download_changed_files(url, changes)
             email_status = send_email(changes, url, files=files)
+            whatsapp_status = send_whatsapp(changes, url)
+            print(f"[whatsapp] {whatsapp_status}", flush=True)
 
     return {
         "status": "checked",
@@ -888,6 +972,7 @@ def check_track(url, send_emails=True):
         "total_rows": total_current,
         "changes": changes,
         "email_status": email_status,
+        "whatsapp_status": whatsapp_status,
         "files": files,
     }
 
@@ -905,6 +990,26 @@ def simulate_track(url, fake_date="01/01/1900"):
             save_track(url, track)
             return True
     return False
+
+
+def simulate_pdf_change(url):
+    """For demos: change a numeric value in the most-recently-saved PDF for
+    this URL, then call simulate_track() so the next check fires an UPDATED
+    event. After the next check, the new (real) download differs from the
+    modified saved file, producing a visible highlight diff."""
+    out_dir = FILES_DIR / url_id(url)
+    if not out_dir.exists():
+        return False
+    pdfs = sorted(
+        (p for p in out_dir.glob("*.pdf") if "-highlighted" not in p.stem),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not pdfs:
+        return False
+    if not mutate_one_number(pdfs[0]):
+        return False
+    return simulate_track(url)
 
 
 def check_all(send_emails=True):
