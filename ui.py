@@ -9,15 +9,14 @@ import threading
 import time
 from pathlib import Path
 
+import psycopg
 from flask import Flask, jsonify, request, send_from_directory
 
 from mavat_watch import (
+    DATABASE_URL,
     add_track,
     check_track,
-    history_count,
     list_tracks,
-    load_history,
-    plan_label,
     remove_track,
     simulate_pdf_change,
     simulate_track,
@@ -46,21 +45,48 @@ threading.Thread(target=background_checker, daemon=True).start()
 
 
 def build_tracks():
-    out = []
-    for track in list_tracks():
-        url = track["url"]
-        out.append({
+    with psycopg.connect(DATABASE_URL) as conn:
+        tracks = conn.execute(
+            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json"
+            " FROM tracks ORDER BY added_at"
+        ).fetchall()
+        if not tracks:
+            return []
+        urls = [t[0] for t in tracks]
+        history_rows = conn.execute(
+            "SELECT url, ts, section, action, name, category, scope, edit_date,"
+            " prev_scope, prev_edit_date FROM history WHERE url = ANY(%s) ORDER BY id DESC",
+            (urls,),
+        ).fetchall()
+        counts = dict(conn.execute(
+            "SELECT url, COUNT(*) FROM history WHERE url = ANY(%s) GROUP BY url",
+            (urls,),
+        ).fetchall())
+
+    history_by_url: dict[str, list] = {}
+    for h in history_rows:
+        bucket = history_by_url.setdefault(h[0], [])
+        if len(bucket) < 10:
+            bucket.append({
+                "ts": h[1], "section": h[2], "action": h[3], "name": h[4],
+                "category": h[5], "scope": h[6], "edit_date": h[7],
+                "prev_scope": h[8], "prev_edit_date": h[9],
+            })
+
+    return [
+        {
             "id": url_id(url),
             "url": url,
-            "label": plan_label(url),
-            "title": track.get("plan_title", ""),
-            "added_at": track.get("added_at", track.get("last_check", "")),
-            "last_check": track.get("last_check", ""),
-            "total_rows": sum(len(rows) for rows in track.get("rows", {}).values()),
-            "history": load_history(url, limit=10),
-            "history_count": history_count(url),
-        })
-    return out
+            "label": f"תוכנית {plan_number}" if plan_number else "תוכנית (טוען…)",
+            "title": plan_title or "",
+            "added_at": added_at,
+            "last_check": last_check,
+            "total_rows": sum(len(rows) for rows in (rows_json or {}).values()),
+            "history": history_by_url.get(url, []),
+            "history_count": counts.get(url, 0),
+        }
+        for url, added_at, last_check, plan_number, plan_title, rows_json in tracks
+    ]
 
 
 def find_track_by_id(track_id):
