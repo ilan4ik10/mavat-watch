@@ -590,9 +590,15 @@ def history_count(url):
         return conn.execute("SELECT COUNT(*) FROM history WHERE url = %s", (url,)).fetchone()[0]
 
 
-def _find_previous_version(out_dir, suggested, exclude):
+def _safe_row(name):
+    return re.sub(r"[^\w-]+", "_", name).strip("_")[:80] or "row"
+
+
+def _find_previous_version(out_dir, safe_row, exclude):
+    marker = f"__{safe_row}__"
     candidates = [p for p in out_dir.iterdir()
-                  if p.is_file() and p != exclude and p.name.endswith("_" + suggested)]
+                  if p.is_file() and p != exclude
+                  and marker in p.name and "-highlighted" not in p.stem]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -672,15 +678,17 @@ def download_changed_files(url, changes):
                 download = dl.value
                 suggested = download.suggested_filename or f"{url_id(url)}_doc"
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                target = out_dir / f"{stamp}_{suggested}"
+                safe = _safe_row(change.name)
+                target = out_dir / f"{stamp}__{safe}__{suggested}"
                 download.save_as(target)
                 size = target.stat().st_size
                 entry["path"] = str(target)
                 entry["filename"] = suggested
+                entry["row"] = change.name
                 entry["size"] = size
-                print(f"[download]   ✓ saved {suggested} ({size} bytes) -> {target}", flush=True)
+                print(f"[download]   ✓ saved {target.name} ({size} bytes)", flush=True)
                 if change.action == "UPDATED" and target.suffix.lower() == ".pdf":
-                    prev = _find_previous_version(out_dir, suggested, target)
+                    prev = _find_previous_version(out_dir, safe, target)
                     if prev:
                         stem = target.stem
                         hl_target = out_dir / f"{stem}-highlighted.pdf"
@@ -692,7 +700,7 @@ def download_changed_files(url, changes):
                                 entry["highlighted_size"] = hl_target.stat().st_size
                                 print(f"[download]   ✓ highlighted {n} change(s) vs {prev.name} -> {hl_target}", flush=True)
                             else:
-                                print(f"[download]   no text-level diff vs {prev.name}", flush=True)
+                                print(f"[download]   no text-level diff vs {prev.name} (image-only or identical text)", flush=True)
                         except Exception as exc:
                             print(f"[download]   pdfdiff failed: {type(exc).__name__}: {exc}", flush=True)
             except Exception as exc:
@@ -877,7 +885,6 @@ def send_email(changes, url, files=None):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as smtp:
             smtp.login(user, password)
             smtp.send_message(message)
-        attached = sum(1 for f in files if f.get("path") and f.get("size", 0) <= MAX_ATTACH_BYTES)
         suffix = f" ({attached} קבצים מצורפים)" if attached else ""
         return f"המייל נשלח אל {recipient}{suffix}"
     except Exception as exc:
@@ -977,40 +984,82 @@ def check_track(url, send_emails=True):
     }
 
 
-def simulate_track(url, fake_date="01/01/1900"):
+def simulate_track(url, fake_date="01/01/1900", target_name=None):
     track = load_track(url)
     if not track:
         return False
     rows = rows_from_json(track.get("rows", {}))
     for section in SECTIONS:
         section_rows = rows.get(section, [])
-        if section_rows:
-            section_rows[0] = Row(**{**asdict(section_rows[0]), "edit_date": fake_date})
-            track["rows"] = rows_to_json(rows)
-            save_track(url, track)
-            return True
+        for i, row in enumerate(section_rows):
+            if target_name is None or row.name == target_name:
+                section_rows[i] = Row(**{**asdict(row), "edit_date": fake_date})
+                track["rows"] = rows_to_json(rows)
+                save_track(url, track)
+                return True
+            if target_name is None:
+                break
     return False
 
 
 def simulate_pdf_change(url):
-    """For demos: change a numeric value in a saved PDF for this URL, then
-    call simulate_track() so the next check fires an UPDATED event. After
-    the next check, the new (real) download differs from the modified saved
-    file, producing a visible highlight diff. Tries PDFs newest-first until
-    one mutates successfully (image-only blueprints have no mutable text)."""
+    """For demos: pick a tracked row whose saved PDF can be mutated, change
+    one number inside that PDF, then tamper that specific row's edit_date in
+    the DB. On the next check, the new (real) download differs from the
+    mutated file, producing a visible highlight diff. Looks up PDFs by row
+    name via the __<safe_row>__ pattern in filenames; falls back to legacy
+    (any-PDF) iteration for files saved before the naming refactor."""
     out_dir = FILES_DIR / url_id(url)
     if not out_dir.exists():
         return False
-    pdfs = sorted(
-        (p for p in out_dir.glob("*.pdf") if "-highlighted" not in p.stem),
+    track = load_track(url)
+    if not track:
+        return False
+    rows_by_section = track.get("rows", {})
+
+    for section in SECTIONS:
+        for row in rows_by_section.get(section, []):
+            name = row["name"] if isinstance(row, dict) else row.name
+            if not name:
+                continue
+            safe = _safe_row(name)
+            marker = f"__{safe}__"
+            pdfs = sorted(
+                (p for p in out_dir.glob("*.pdf")
+                 if "-highlighted" not in p.stem and marker in p.name),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if pdfs and mutate_one_number(pdfs[0]):
+                print(f"[simulate-pdf] mutated {pdfs[0].name} for row {name!r}", flush=True)
+                return simulate_track(url, target_name=name)
+
+    print(f"[simulate-pdf] no row-tagged PDF mutated; falling back to legacy scan", flush=True)
+    legacy = sorted(
+        (p for p in out_dir.glob("*.pdf")
+         if "-highlighted" not in p.stem and "__" not in p.name),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    for pdf in pdfs:
+    target_name = None
+    for section in SECTIONS:
+        rows = rows_by_section.get(section, [])
+        if rows:
+            first = rows[0]
+            target_name = first["name"] if isinstance(first, dict) else first.name
+            break
+    for pdf in legacy:
         if mutate_one_number(pdf):
-            print(f"[simulate-pdf] mutated {pdf.name}", flush=True)
-            return simulate_track(url)
-    print(f"[simulate-pdf] tried {len(pdfs)} PDF(s) for {url}, none mutable", flush=True)
+            print(f"[simulate-pdf] mutated legacy {pdf.name}", flush=True)
+            if target_name:
+                import shutil
+                safe = _safe_row(target_name)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tagged = out_dir / f"{stamp}__{safe}__legacy_{pdf.name}"
+                shutil.copy(pdf, tagged)
+                print(f"[simulate-pdf] tagged copy for diff: {tagged.name}", flush=True)
+            return simulate_track(url, target_name=target_name)
+    print(f"[simulate-pdf] no mutable PDF found", flush=True)
     return False
 
 

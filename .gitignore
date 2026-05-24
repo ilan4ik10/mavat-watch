@@ -6,6 +6,14 @@ __pycache__/
 .DS_Store
 *.egg-info/
 
+frontend/node_modules/
+frontend/dist/
+frontend/*.log
+frontend/*.tsbuildinfo
+
 # local-only secrets — never commit
 run-local.sh
 .env
+
+# local test artifacts at the repo root — never commit
+mavat-*.pdf

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mavat-watch
+    runtime: python
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -m playwright install --with-deps chromium &&
+      cd frontend && npm ci && npm run build
+    startCommand: python ui.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
