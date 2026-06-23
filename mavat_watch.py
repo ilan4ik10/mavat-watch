@@ -32,18 +32,24 @@ def _step(label, t0):
     return time.perf_counter()
 
 SECTIONS = ["מסמכי התכנית", "מסמכי מידע מנהלי", "נוסחי פרסום"]
+# Sections whose accordion title carries a numeric count badge we track (and
+# notify on when the number changes), rather than the documents inside them.
+COUNT_SECTIONS = ["התנגדויות"]
 FILES_DIR = Path.home() / ".cache" / "mavat-watch" / "files"
 ACTION_LABEL_HE = {
     "NEW": "חדש", "UPDATED": "עודכן", "REMOVED": "הוסר",
     "SECTION_NEW": "מקטע חדש", "SECTION_REMOVED": "מקטע הוסר",
+    "COUNT_CHANGED": "מספר עודכן",
 }
 ACTION_COLOR = {
     "NEW": "#16a34a", "UPDATED": "#ea580c", "REMOVED": "#dc2626",
     "SECTION_NEW": "#2563eb", "SECTION_REMOVED": "#b91c1c",
+    "COUNT_CHANGED": "#ea580c",
 }
 ACTION_BG = {
     "NEW": "#f0fdf4", "UPDATED": "#fff7ed", "REMOVED": "#fef2f2",
     "SECTION_NEW": "#eff6ff", "SECTION_REMOVED": "#fef2f2",
+    "COUNT_CHANGED": "#fff7ed",
 }
 MAX_ATTACH_BYTES = 20 * 1024 * 1024
 
@@ -57,9 +63,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     plan_number   TEXT NOT NULL DEFAULT '',
     plan_title    TEXT NOT NULL DEFAULT '',
     rows_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
-    sections_present JSONB NOT NULL DEFAULT '[]'::jsonb
+    sections_present JSONB NOT NULL DEFAULT '[]'::jsonb,
+    section_counts JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS sections_present JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS section_counts JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS history (
     id              BIGSERIAL PRIMARY KEY,
     url             TEXT NOT NULL,
@@ -210,6 +218,30 @@ EXTRACT_ALL_ROWS_JS = r"""
 """
 
 
+EXTRACT_SECTION_COUNTS_JS = r"""
+(labels) => {
+    const result = {};
+    document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
+        const title = li.querySelector(':scope > .uk-accordion-title');
+        if (!title) return;
+        const text = (title.innerText || '').trim();
+        const match = labels.find(l => text.includes(l));
+        if (!match) return;
+        // The count lives in a dedicated badge element inside the title, not in
+        // free text. Read its digits (stripping commas/spaces); null if absent.
+        const badge = title.querySelector('.uk-badge-round');
+        let count = null;
+        if (badge) {
+            const digits = (badge.innerText || '').replace(/[^\d]/g, '');
+            if (digits !== '') count = parseInt(digits, 10);
+        }
+        result[match] = count;
+    });
+    return result;
+}
+"""
+
+
 def url_id(url):
     match = re.search(r"/SV4/\d+/(\d+)(?:/(\d+))?", url)
     if match:
@@ -352,11 +384,17 @@ def _do_capture(page, url):
     counts = {label: len(rows[label]) for label in SECTIONS}
     t = _step(f"extract all rows {counts}; sections present={present}", t)
 
+    try:
+        section_counts = page.evaluate(EXTRACT_SECTION_COUNTS_JS, COUNT_SECTIONS)
+    except Exception:
+        section_counts = {}
+    t = _step(f"extract section counts {section_counts}", t)
+
     total_ms = (time.perf_counter() - start) * 1000
     print(f"[time] === capture done in {total_ms:.0f} ms ===", flush=True)
     return {
         "rows": rows, "plan_number": plan_number, "plan_title": plan_title,
-        "sections_present": present,
+        "sections_present": present, "section_counts": section_counts,
     }
 
 
@@ -512,13 +550,15 @@ def format_change(c):
         line += f"  ({c.edit_date}, {c.scope})"
     elif c.action == "REMOVED":
         line += f"  (היה: {c.prev_edit_date}, {c.prev_scope})"
+    elif c.action == "COUNT_CHANGED":
+        line += f"  {c.prev_scope} → {c.scope}"
     return line
 
 
 def load_track(url):
     with psycopg.connect(DATABASE_URL) as conn:
         row = conn.execute(
-            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present FROM tracks WHERE url = %s",
+            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present, section_counts FROM tracks WHERE url = %s",
             (url,),
         ).fetchone()
     if not row:
@@ -528,6 +568,7 @@ def load_track(url):
         "plan_number": row[3], "plan_title": row[4],
         "rows": row[5] or {},
         "sections_present": row[6] or [],
+        "section_counts": row[7] or {},
     }
 
 
@@ -535,20 +576,22 @@ def save_track(url, track):
     with psycopg.connect(DATABASE_URL) as conn:
         conn.execute(
             """
-            INSERT INTO tracks (url, added_at, last_check, plan_number, plan_title, rows_json, sections_present)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+            INSERT INTO tracks (url, added_at, last_check, plan_number, plan_title, rows_json, sections_present, section_counts)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
             ON CONFLICT (url) DO UPDATE SET
                 last_check       = EXCLUDED.last_check,
                 plan_number      = EXCLUDED.plan_number,
                 plan_title       = EXCLUDED.plan_title,
                 rows_json        = EXCLUDED.rows_json,
-                sections_present = EXCLUDED.sections_present
+                sections_present = EXCLUDED.sections_present,
+                section_counts   = EXCLUDED.section_counts
             """,
             (
                 track["url"], track["added_at"], track["last_check"],
                 track.get("plan_number", ""), track.get("plan_title", ""),
                 json.dumps(track.get("rows", {}), ensure_ascii=False),
                 json.dumps(track.get("sections_present", []), ensure_ascii=False),
+                json.dumps(track.get("section_counts", {}), ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -557,12 +600,12 @@ def save_track(url, track):
 def list_tracks():
     with psycopg.connect(DATABASE_URL) as conn:
         rows = conn.execute(
-            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present FROM tracks ORDER BY added_at"
+            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present, section_counts FROM tracks ORDER BY added_at"
         ).fetchall()
     return [
         {"url": r[0], "added_at": r[1], "last_check": r[2],
          "plan_number": r[3], "plan_title": r[4], "rows": r[5] or {},
-         "sections_present": r[6] or []}
+         "sections_present": r[6] or [], "section_counts": r[7] or {}}
         for r in rows
     ]
 
@@ -759,6 +802,11 @@ def build_email_html(changes, url, files):
                 detail += f" · תחולה: <strong>{c.scope}</strong>"
         elif c.action == "REMOVED":
             detail = f"היה: {c.prev_edit_date or '—'}"
+        elif c.action == "COUNT_CHANGED":
+            detail = (
+                f'מספר עודכן: <span style="text-decoration:line-through;color:#9ca3af">{c.prev_scope}</span>'
+                f' ← <strong>{c.scope}</strong>'
+            )
 
         file_line = ""
         f = files_by_name.get(c.name)
@@ -803,6 +851,8 @@ def build_email_plain(changes, url):
             lines.append(f"    תאריך עריכה: {c.prev_edit_date} → {c.edit_date}")
         elif c.action == "NEW":
             lines.append(f"    תאריך עריכה: {c.edit_date}")
+        elif c.action == "COUNT_CHANGED":
+            lines.append(f"    מספר: {c.prev_scope} → {c.scope}")
     lines.append("")
     lines.append(url)
     return "\n".join(lines)
@@ -832,6 +882,8 @@ def send_whatsapp(changes, url):
             line += f" — תאריך עריכה: {c.prev_edit_date} → {c.edit_date}"
         elif c.action == "NEW":
             line += f" — תאריך עריכה: {c.edit_date}"
+        elif c.action == "COUNT_CHANGED":
+            line += f" · מספר: {c.prev_scope} → {c.scope}"
         lines.append(line)
     lines.append("")
     lines.append(url)
@@ -937,6 +989,7 @@ def add_track(url):
         "plan_title": snapshot["plan_title"],
         "rows": rows_to_json(rows),
         "sections_present": snapshot.get("sections_present", []),
+        "section_counts": snapshot.get("section_counts", {}),
     })
     _step("save_track", t)
     total_ms = (time.perf_counter() - add_t) * 1000
@@ -952,15 +1005,17 @@ def check_track(url, send_emails=True):
     snapshot = capture(url)
     current_rows = snapshot["rows"]
     current_present = snapshot.get("sections_present", [])
+    current_counts = snapshot.get("section_counts", {})
     previous_rows = rows_from_json(track.get("rows", {}))
     previous_present = list(track.get("sections_present") or [])
+    previous_counts = dict(track.get("section_counts") or {})
 
     raw_total = sum(len(rows) for rows in current_rows.values())
     total_previous = sum(len(rows) for rows in previous_rows.values())
 
     # Master failure gate: the scrape produced nothing usable (no document rows
     # AND no section titles) while we had data before. Almost certainly a
-    # transient load failure, not a real emptying — change nothing and leave
+    # transient load failure, not a real emptying, so change nothing and leave
     # last_check untouched so the UI keeps showing the last successful check.
     if raw_total == 0 and not current_present and (total_previous > 0 or previous_present):
         print(f"[check] capture produced no rows and no sections for {url}; "
@@ -969,7 +1024,7 @@ def check_track(url, send_emails=True):
                 "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
 
     # Per-section preservation: a section that came back empty but had rows
-    # before is almost always a partial load — keep the old rows so we never
+    # before is almost always a partial load, so keep the old rows so we never
     # emit a storm of false per-document REMOVALs.
     for section in SECTIONS:
         prev_section = previous_rows.get(section, [])
@@ -993,6 +1048,28 @@ def check_track(url, send_emails=True):
         print(f"[check] section presence changed for {url}: "
               f"{[(c.action, c.section) for c in section_changes]}", flush=True)
 
+    # Count-badge diff (e.g. number of objections in התנגדויות). Only fire when
+    # both the old and new values are real numbers and differ. A first sight
+    # (no previous) baselines silently, and a missing current value (section not
+    # read this round) never reports a spurious drop. merged_counts preserves
+    # the previous value when the current read lacks it, so a flaky read cannot
+    # wipe the baseline.
+    count_changes = []
+    merged_counts = dict(previous_counts)
+    for label in COUNT_SECTIONS:
+        prev = previous_counts.get(label)
+        curr = current_counts.get(label)
+        if curr is not None:
+            merged_counts[label] = curr
+        if prev is not None and curr is not None and prev != curr:
+            count_changes.append(Change(
+                section=label, action="COUNT_CHANGED", name=label,
+                scope=str(curr), prev_scope=str(prev),
+            ))
+    if count_changes:
+        print(f"[check] section counts changed for {url}: "
+              f"{[(c.name, c.prev_scope, c.scope) for c in count_changes]}", flush=True)
+
     if total_previous == 0 and total_current > 0:
         print(f"[check] previous baseline was empty for {url}; rebasing to {total_current} rows without writing history", flush=True)
         track["last_check"] = timestamp
@@ -1000,17 +1077,19 @@ def check_track(url, send_emails=True):
         track["plan_title"] = snapshot["plan_title"] or track.get("plan_title", "")
         track["rows"] = rows_to_json(current_rows)
         track["sections_present"] = current_present
+        track["section_counts"] = merged_counts
         save_track(url, track)
         return {"status": "rebased", "url": url, "total_rows": total_current,
                 "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
 
-    changes = section_changes + diff_all(previous_rows, current_rows)
+    changes = section_changes + count_changes + diff_all(previous_rows, current_rows)
 
     track["last_check"] = timestamp
     track["plan_number"] = snapshot["plan_number"] or track.get("plan_number", "")
     track["plan_title"] = snapshot["plan_title"] or track.get("plan_title", "")
     track["rows"] = rows_to_json(current_rows)
     track["sections_present"] = current_present
+    track["section_counts"] = merged_counts
     save_track(url, track)
 
     email_status = ""

@@ -22,5 +22,6 @@ const ACTION_LABEL: Record<string, string> = {
   REMOVED: 'הוסר',
   SECTION_NEW: 'מקטע חדש',
   SECTION_REMOVED: 'מקטע הוסר',
+  COUNT_CHANGED: 'מספר עודכן',
 };
 export const actionHe = (a: string) => ACTION_LABEL[a] ?? a;
