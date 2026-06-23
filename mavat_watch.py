@@ -33,9 +33,18 @@ def _step(label, t0):
 
 SECTIONS = ["מסמכי התכנית", "מסמכי מידע מנהלי", "נוסחי פרסום"]
 FILES_DIR = Path.home() / ".cache" / "mavat-watch" / "files"
-ACTION_LABEL_HE = {"NEW": "חדש", "UPDATED": "עודכן", "REMOVED": "הוסר"}
-ACTION_COLOR = {"NEW": "#16a34a", "UPDATED": "#ea580c", "REMOVED": "#dc2626"}
-ACTION_BG = {"NEW": "#f0fdf4", "UPDATED": "#fff7ed", "REMOVED": "#fef2f2"}
+ACTION_LABEL_HE = {
+    "NEW": "חדש", "UPDATED": "עודכן", "REMOVED": "הוסר",
+    "SECTION_NEW": "מקטע חדש", "SECTION_REMOVED": "מקטע הוסר",
+}
+ACTION_COLOR = {
+    "NEW": "#16a34a", "UPDATED": "#ea580c", "REMOVED": "#dc2626",
+    "SECTION_NEW": "#2563eb", "SECTION_REMOVED": "#b91c1c",
+}
+ACTION_BG = {
+    "NEW": "#f0fdf4", "UPDATED": "#fff7ed", "REMOVED": "#fef2f2",
+    "SECTION_NEW": "#eff6ff", "SECTION_REMOVED": "#fef2f2",
+}
 MAX_ATTACH_BYTES = 20 * 1024 * 1024
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -47,8 +56,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     last_check    TEXT NOT NULL,
     plan_number   TEXT NOT NULL DEFAULT '',
     plan_title    TEXT NOT NULL DEFAULT '',
-    rows_json     JSONB NOT NULL DEFAULT '{}'::jsonb
+    rows_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    sections_present JSONB NOT NULL DEFAULT '[]'::jsonb
 );
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS sections_present JSONB NOT NULL DEFAULT '[]'::jsonb;
 CREATE TABLE IF NOT EXISTS history (
     id              BIGSERIAL PRIMARY KEY,
     url             TEXT NOT NULL,
@@ -334,12 +345,19 @@ def _do_capture(page, url):
                     section=label, category=r["category"], name=r["name"],
                     scope=r["scope"], edit_date=r["edit_date"],
                 ))
+    # all_data only carries keys for section titles actually present in the
+    # accordion (absent sections never become keys), so its key set is exactly
+    # which of the tracked sections exist on the page right now.
+    present = [label for label in SECTIONS if label in all_data]
     counts = {label: len(rows[label]) for label in SECTIONS}
-    t = _step(f"extract all rows {counts}", t)
+    t = _step(f"extract all rows {counts}; sections present={present}", t)
 
     total_ms = (time.perf_counter() - start) * 1000
     print(f"[time] === capture done in {total_ms:.0f} ms ===", flush=True)
-    return {"rows": rows, "plan_number": plan_number, "plan_title": plan_title}
+    return {
+        "rows": rows, "plan_number": plan_number, "plan_title": plan_title,
+        "sections_present": present,
+    }
 
 
 _capture_queue: queue.Queue = queue.Queue()
@@ -500,7 +518,7 @@ def format_change(c):
 def load_track(url):
     with psycopg.connect(DATABASE_URL) as conn:
         row = conn.execute(
-            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json FROM tracks WHERE url = %s",
+            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present FROM tracks WHERE url = %s",
             (url,),
         ).fetchone()
     if not row:
@@ -509,6 +527,7 @@ def load_track(url):
         "url": row[0], "added_at": row[1], "last_check": row[2],
         "plan_number": row[3], "plan_title": row[4],
         "rows": row[5] or {},
+        "sections_present": row[6] or [],
     }
 
 
@@ -516,18 +535,20 @@ def save_track(url, track):
     with psycopg.connect(DATABASE_URL) as conn:
         conn.execute(
             """
-            INSERT INTO tracks (url, added_at, last_check, plan_number, plan_title, rows_json)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            INSERT INTO tracks (url, added_at, last_check, plan_number, plan_title, rows_json, sections_present)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
             ON CONFLICT (url) DO UPDATE SET
-                last_check  = EXCLUDED.last_check,
-                plan_number = EXCLUDED.plan_number,
-                plan_title  = EXCLUDED.plan_title,
-                rows_json   = EXCLUDED.rows_json
+                last_check       = EXCLUDED.last_check,
+                plan_number      = EXCLUDED.plan_number,
+                plan_title       = EXCLUDED.plan_title,
+                rows_json        = EXCLUDED.rows_json,
+                sections_present = EXCLUDED.sections_present
             """,
             (
                 track["url"], track["added_at"], track["last_check"],
                 track.get("plan_number", ""), track.get("plan_title", ""),
                 json.dumps(track.get("rows", {}), ensure_ascii=False),
+                json.dumps(track.get("sections_present", []), ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -536,11 +557,12 @@ def save_track(url, track):
 def list_tracks():
     with psycopg.connect(DATABASE_URL) as conn:
         rows = conn.execute(
-            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json FROM tracks ORDER BY added_at"
+            "SELECT url, added_at, last_check, plan_number, plan_title, rows_json, sections_present FROM tracks ORDER BY added_at"
         ).fetchall()
     return [
         {"url": r[0], "added_at": r[1], "last_check": r[2],
-         "plan_number": r[3], "plan_title": r[4], "rows": r[5] or {}}
+         "plan_number": r[3], "plan_title": r[4], "rows": r[5] or {},
+         "sections_present": r[6] or []}
         for r in rows
     ]
 
@@ -914,6 +936,7 @@ def add_track(url):
         "plan_number": snapshot["plan_number"],
         "plan_title": snapshot["plan_title"],
         "rows": rows_to_json(rows),
+        "sections_present": snapshot.get("sections_present", []),
     })
     _step("save_track", t)
     total_ms = (time.perf_counter() - add_t) * 1000
@@ -928,8 +951,26 @@ def check_track(url, send_emails=True):
     timestamp = datetime.now().isoformat(timespec="seconds")
     snapshot = capture(url)
     current_rows = snapshot["rows"]
+    current_present = snapshot.get("sections_present", [])
     previous_rows = rows_from_json(track.get("rows", {}))
+    previous_present = list(track.get("sections_present") or [])
 
+    raw_total = sum(len(rows) for rows in current_rows.values())
+    total_previous = sum(len(rows) for rows in previous_rows.values())
+
+    # Master failure gate: the scrape produced nothing usable (no document rows
+    # AND no section titles) while we had data before. Almost certainly a
+    # transient load failure, not a real emptying — change nothing and leave
+    # last_check untouched so the UI keeps showing the last successful check.
+    if raw_total == 0 and not current_present and (total_previous > 0 or previous_present):
+        print(f"[check] capture produced no rows and no sections for {url}; "
+              f"treating as failure, baseline left untouched", flush=True)
+        return {"status": "capture_failed", "url": url, "total_rows": total_previous,
+                "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
+
+    # Per-section preservation: a section that came back empty but had rows
+    # before is almost always a partial load — keep the old rows so we never
+    # emit a storm of false per-document REMOVALs.
     for section in SECTIONS:
         prev_section = previous_rows.get(section, [])
         if not current_rows[section] and prev_section:
@@ -937,13 +978,20 @@ def check_track(url, send_emails=True):
             current_rows[section] = prev_section
 
     total_current = sum(len(rows) for rows in current_rows.values())
-    total_previous = sum(len(rows) for rows in previous_rows.values())
 
-    if total_current == 0 and total_previous > 0:
-        print(f"[check] capture returned 0 rows for {url} but previous had {total_previous}; treating as failure", flush=True)
-        track["last_check"] = timestamp
-        save_track(url, track)
-        return {"status": "capture_failed", "url": url, "total_rows": 0, "changes": [], "email_status": "", "files": []}
+    # Section-presence diff. Old tracks predate the sections_present column, so
+    # when previous_present is empty we establish it silently (saved below)
+    # instead of reporting every existing section as newly added.
+    section_changes = []
+    if previous_present:
+        for section in SECTIONS:
+            if section in current_present and section not in previous_present:
+                section_changes.append(Change(section=section, action="SECTION_NEW", name=section))
+            elif section in previous_present and section not in current_present:
+                section_changes.append(Change(section=section, action="SECTION_REMOVED", name=section))
+    if section_changes:
+        print(f"[check] section presence changed for {url}: "
+              f"{[(c.action, c.section) for c in section_changes]}", flush=True)
 
     if total_previous == 0 and total_current > 0:
         print(f"[check] previous baseline was empty for {url}; rebasing to {total_current} rows without writing history", flush=True)
@@ -951,15 +999,18 @@ def check_track(url, send_emails=True):
         track["plan_number"] = snapshot["plan_number"] or track.get("plan_number", "")
         track["plan_title"] = snapshot["plan_title"] or track.get("plan_title", "")
         track["rows"] = rows_to_json(current_rows)
+        track["sections_present"] = current_present
         save_track(url, track)
-        return {"status": "rebased", "url": url, "total_rows": total_current, "changes": [], "email_status": "", "files": []}
+        return {"status": "rebased", "url": url, "total_rows": total_current,
+                "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
 
-    changes = diff_all(previous_rows, current_rows)
+    changes = section_changes + diff_all(previous_rows, current_rows)
 
     track["last_check"] = timestamp
     track["plan_number"] = snapshot["plan_number"] or track.get("plan_number", "")
     track["plan_title"] = snapshot["plan_title"] or track.get("plan_title", "")
     track["rows"] = rows_to_json(current_rows)
+    track["sections_present"] = current_present
     save_track(url, track)
 
     email_status = ""

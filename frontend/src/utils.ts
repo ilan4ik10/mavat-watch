@@ -16,5 +16,11 @@ export function niceTs(iso: string): string {
   return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-const ACTION_LABEL: Record<string, string> = { NEW: 'חדש', UPDATED: 'עודכן', REMOVED: 'הוסר' };
+const ACTION_LABEL: Record<string, string> = {
+  NEW: 'חדש',
+  UPDATED: 'עודכן',
+  REMOVED: 'הוסר',
+  SECTION_NEW: 'מקטע חדש',
+  SECTION_REMOVED: 'מקטע הוסר',
+};
 export const actionHe = (a: string) => ACTION_LABEL[a] ?? a;

@@ -1,4 +1,4 @@
-export type Action = 'NEW' | 'UPDATED' | 'REMOVED';
+export type Action = 'NEW' | 'UPDATED' | 'REMOVED' | 'SECTION_NEW' | 'SECTION_REMOVED';
 
 export interface HistoryEntry {
   ts: string;
