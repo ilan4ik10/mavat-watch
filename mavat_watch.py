@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -973,7 +973,7 @@ def add_track(url):
         _step("load_track (exists check)", t)
         return {"status": "exists", "url": url}
     t = _step("load_track (exists check)", t)
-    timestamp = datetime.now().isoformat(timespec="seconds")
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     snapshot = capture(url)
     t = _step("add_track: capture() returned", t)
     rows = snapshot["rows"]
@@ -1001,7 +1001,7 @@ def check_track(url, send_emails=True):
     track = load_track(url)
     if not track:
         return {"status": "not_tracked", "url": url}
-    timestamp = datetime.now().isoformat(timespec="seconds")
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     snapshot = capture(url)
     current_rows = snapshot["rows"]
     current_present = snapshot.get("sections_present", [])
