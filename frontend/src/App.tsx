@@ -47,8 +47,6 @@ export default function App() {
             <TrackList
               tracks={tracks}
               onCheck={(id) => run('בודק את התכנית ברגעים אלה', () => api.check(id))}
-              onSimulate={(id) => run('מבצע סימולציה (תאריך)', () => api.simulate(id))}
-              onSimulatePdf={(id) => run('מבצע סימולציה (PDF)', () => api.simulatePdf(id))}
               onRemove={(id) => run('מסיר את התכנית מהמעקב', () => api.remove(id))}
             />
           ))}

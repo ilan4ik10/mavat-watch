@@ -5,18 +5,10 @@ import HistoryDetails from './HistoryDetails';
 interface Props {
   track: Track;
   onCheck: () => void;
-  onSimulate: () => void;
-  onSimulatePdf: () => void;
   onRemove: () => void;
 }
 
-export default function TrackCard({
-  track: t,
-  onCheck,
-  onSimulate,
-  onSimulatePdf,
-  onRemove,
-}: Props) {
+export default function TrackCard({ track: t, onCheck, onRemove }: Props) {
   return (
     <div className="bg-white border border-gray-200 rounded-xl p-5 mb-2">
       <h2 className="text-lg font-semibold mb-1">{t.label}</h2>
@@ -52,22 +44,6 @@ export default function TrackCard({
           className="px-4 py-3 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700"
         >
           בדוק עכשיו
-        </button>
-        <button
-          type="button"
-          onClick={onSimulate}
-          title="שינוי תאריך עריכה בבסיס כדי שהבדיקה הבאה תדווח על שינוי לצורך הדגמה"
-          className="px-4 py-3 bg-transparent text-gray-500 text-sm font-medium border border-gray-200 rounded-md hover:bg-gray-100"
-        >
-          סימולציה (תאריך)
-        </button>
-        <button
-          type="button"
-          onClick={onSimulatePdf}
-          title="משנה ערך מספרי בקובץ ה-PDF השמור, כדי שהבדיקה הבאה תייצר הדגשת שינויים בקובץ"
-          className="px-4 py-3 bg-transparent text-gray-500 text-sm font-medium border border-gray-200 rounded-md hover:bg-gray-100"
-        >
-          סימולציה (PDF)
         </button>
         <button
           type="button"
