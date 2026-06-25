@@ -13,9 +13,14 @@ export default function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [tab, setTab] = useState<TabId>('tracked');
   const [spinner, setSpinner] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.list().then(setTracks).catch((e) => alert('שגיאה: ' + (e as Error).message));
+    api
+      .list()
+      .then(setTracks)
+      .catch((e) => alert('שגיאה: ' + (e as Error).message))
+      .finally(() => setLoading(false));
   }, []);
 
   async function run(message: string, action: () => Promise<Track[]>) {
@@ -35,15 +40,18 @@ export default function App() {
         <Header />
         {spinner && <Spinner text={spinner} />}
         <Tabs active={tab} onChange={setTab} trackedCount={tracks.length} />
-        {tab === 'tracked' && (
-          <TrackList
-            tracks={tracks}
-            onCheck={(id) => run('בודק את התכנית ברגעים אלה', () => api.check(id))}
-            onSimulate={(id) => run('מבצע סימולציה (תאריך)', () => api.simulate(id))}
-            onSimulatePdf={(id) => run('מבצע סימולציה (PDF)', () => api.simulatePdf(id))}
-            onRemove={(id) => run('מסיר את התכנית מהמעקב', () => api.remove(id))}
-          />
-        )}
+        {tab === 'tracked' &&
+          (loading ? (
+            <Spinner text="טוען תכניות" />
+          ) : (
+            <TrackList
+              tracks={tracks}
+              onCheck={(id) => run('בודק את התכנית ברגעים אלה', () => api.check(id))}
+              onSimulate={(id) => run('מבצע סימולציה (תאריך)', () => api.simulate(id))}
+              onSimulatePdf={(id) => run('מבצע סימולציה (PDF)', () => api.simulatePdf(id))}
+              onRemove={(id) => run('מסיר את התכנית מהמעקב', () => api.remove(id))}
+            />
+          ))}
         {tab === 'add' && (
           <AddTrackForm
             onAdd={(url) =>
