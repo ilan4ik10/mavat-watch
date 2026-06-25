@@ -34,22 +34,30 @@ export default function App() {
     }
   }
 
+  if (loading) {
+    return (
+      <div
+        className="bg-page min-h-screen flex items-center justify-center px-4"
+        dir="rtl"
+      >
+        <Spinner text="טוען תכניות" />
+      </div>
+    );
+  }
+
   return (
     <div className="bg-page min-h-screen text-gray-900 py-10 px-4" dir="rtl">
       <main className="max-w-2xl mx-auto">
         <Header />
         {spinner && <Spinner text={spinner} />}
         <Tabs active={tab} onChange={setTab} trackedCount={tracks.length} />
-        {tab === 'tracked' &&
-          (loading ? (
-            <Spinner text="טוען תכניות" />
-          ) : (
-            <TrackList
-              tracks={tracks}
-              onCheck={(id) => run('בודק את התכנית ברגעים אלה', () => api.check(id))}
-              onRemove={(id) => run('מסיר את התכנית מהמעקב', () => api.remove(id))}
-            />
-          ))}
+        {tab === 'tracked' && (
+          <TrackList
+            tracks={tracks}
+            onCheck={(id) => run('בודק את התכנית ברגעים אלה', () => api.check(id))}
+            onRemove={(id) => run('מסיר את התכנית מהמעקב', () => api.remove(id))}
+          />
+        )}
         {tab === 'add' && (
           <AddTrackForm
             onAdd={(url) =>
