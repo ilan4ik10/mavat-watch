@@ -27,18 +27,35 @@ CHECK_INTERVAL_SECONDS = 60
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 app = Flask(__name__, static_folder=None)
-check_lock = threading.Lock()
+
+# Per-plan locks: serialize operations on the SAME plan so the background
+# checker and an API check/add never double-process one plan (which would cause
+# duplicate history rows and duplicate emails), while letting different plans
+# and API calls run without blocking on each other. The single browser worker
+# already serializes the actual scraping, so this lock only guards each plan's
+# load -> diff -> save -> notify read-modify-write.
+_plan_locks: dict[str, threading.Lock] = {}
+_plan_locks_guard = threading.Lock()
+
+
+def _plan_lock(url: str) -> threading.Lock:
+    with _plan_locks_guard:
+        lock = _plan_locks.get(url)
+        if lock is None:
+            lock = threading.Lock()
+            _plan_locks[url] = lock
+        return lock
 
 
 def background_checker():
     while True:
         time.sleep(CHECK_INTERVAL_SECONDS)
-        with check_lock:
-            for track in list_tracks():
-                try:
+        for track in list_tracks():
+            try:
+                with _plan_lock(track["url"]):
                     check_track(track["url"], send_emails=True)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[background] {track['url']}: {type(exc).__name__}: {exc}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[background] {track['url']}: {type(exc).__name__}: {exc}", flush=True)
 
 
 threading.Thread(target=background_checker, daemon=True).start()
@@ -107,7 +124,7 @@ def api_add_track():
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
-    with check_lock:
+    with _plan_lock(url):
         add_track(url)
     return jsonify(build_tracks()), 201
 
@@ -117,7 +134,7 @@ def api_check_track(track_id):
     track = find_track_by_id(track_id)
     if not track:
         return jsonify({"error": "not found"}), 404
-    with check_lock:
+    with _plan_lock(track["url"]):
         check_track(track["url"])
     return jsonify(build_tracks())
 
