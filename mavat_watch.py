@@ -63,7 +63,7 @@ MASS_CHANGE_MIN = 20          # absolute floor so small plans never trip this
 MASS_CHANGE_FRACTION = 0.4    # >40% of the plan's docs changed in one check
 # Field-label text that must never appear inside a clean document name. If it
 # does, the page was scraped before its CSS applied (a degraded capture); we
-# refuse to diff it. Belt-and-suspenders behind the .doc-info extraction.
+# refuse to diff it. Belt-and-suspenders behind the label-strip extraction.
 LABEL_SENTINEL = "שם המסמך"
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -196,28 +196,21 @@ EXPAND_NESTED_JS = r"""
 
 EXTRACT_ALL_ROWS_JS = r"""
 (sections) => {
-    // Read a cell's real value while IGNORING the responsive field labels
+    // Read a cell's full text but DROP the responsive field labels
     // (<span class="uk-hidden@m file-desc">שם המסמך / תאור המסמך / תאריך עריכה /
     // תחולה</span>). Those labels are display:none on desktop, but if the page's
     // CSS bundle hasn't applied yet when we scrape they leak into innerText and
     // make every row look different from the baseline (the false-change storms
-    // that OOM'd the instance). The name/description values carry class
-    // .doc-info; the date/scope values have no class, so we strip the label
-    // spans and read the remaining text. Either path gives the same result
-    // whether or not the stylesheet has applied.
+    // that OOM'd the instance). We remove the label spans by class and read
+    // textContent, which ignores CSS entirely — so the result is identical
+    // whether or not the stylesheet has applied, and it keeps everything else
+    // (e.g. "גליון מספר 1 מתוך 3"). Verified to reproduce the old innerText
+    // names exactly on every row.
     const field = (cell) => {
         if (!cell) return '';
-        const di = [...cell.querySelectorAll('.doc-info')]
-            .map(e => (e.textContent || '').trim()).filter(Boolean);
-        let s;
-        if (di.length) {
-            s = di.join(' ');
-        } else {
-            const clone = cell.cloneNode(true);
-            clone.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
-            s = clone.textContent || '';
-        }
-        return s.trim().replace(/\s+/g, ' ');
+        const clone = cell.cloneNode(true);
+        clone.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
+        return (clone.textContent || '').trim().replace(/\s+/g, ' ');
     };
     const result = {};
     document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
@@ -355,7 +348,7 @@ def _do_capture(page, url):
     # labels. domcontentloaded fires before the stylesheet, which is exactly the
     # window where the labels leak. `load` also waits for images/fonts, so under
     # a stuck asset it can time out; that's fine — the content wait below plus
-    # the .doc-info extraction don't depend on it, so we continue.
+    # the label-strip extraction don't depend on it, so we continue.
     try:
         page.goto(url, wait_until="load", timeout=60_000)
         t = _step("goto + load", t)
@@ -690,14 +683,9 @@ def download_changed_files(url, changes, max_downloads=MAX_DOWNLOADS_PER_CHECK):
                         // match the clean stored name regardless of CSS state.
                         const field = (cell) => {
                             if (!cell) return '';
-                            const di = [...cell.querySelectorAll('.doc-info')]
-                                .map(e => (e.textContent || '').trim()).filter(Boolean);
-                            let s;
-                            if (di.length) { s = di.join(' '); }
-                            else { const c = cell.cloneNode(true);
-                                   c.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
-                                   s = c.textContent || ''; }
-                            return s.trim().replace(/\s+/g, ' ');
+                            const c = cell.cloneNode(true);
+                            c.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
+                            return (c.textContent || '').trim().replace(/\s+/g, ' ');
                         };
                         document.querySelectorAll('[data-mavat-target]').forEach(e => e.removeAttribute('data-mavat-target'));
                         let panel = null;
@@ -1024,7 +1012,7 @@ def check_track(url, send_emails=True):
 
     # Label-pollution gate: a clean name never contains the field-label text. If
     # any does, the page was scraped before its CSS applied (a degraded capture);
-    # .doc-info should prevent this, but if it ever slips through we refuse to
+    # label-strip should prevent this, but if it ever slips through we refuse to
     # diff so we can't emit a false-change storm. Baseline left untouched.
     if any(LABEL_SENTINEL in r.name for rows in current_rows.values() for r in rows):
         print(f"[check] capture for {url} contains field-label text "
