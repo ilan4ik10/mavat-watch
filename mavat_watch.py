@@ -9,7 +9,6 @@ import argparse
 import json
 import mimetypes
 import os
-import queue
 import re
 import smtplib
 import sys
@@ -52,6 +51,20 @@ ACTION_BG = {
     "COUNT_CHANGED": "#fff7ed",
 }
 MAX_ATTACH_BYTES = 20 * 1024 * 1024
+
+# Notification safety limits. Both OOM incidents were driven by a single check
+# trying to download ~100 files at once. Cap how many files we download per
+# check, and if a check turns over a large fraction of a plan's documents treat
+# it as a mass change: still record + email the list, but skip the per-file
+# download storm. Real large deposits are rare; a storm this size is far more
+# often a degraded capture.
+MAX_DOWNLOADS_PER_CHECK = 12
+MASS_CHANGE_MIN = 20          # absolute floor so small plans never trip this
+MASS_CHANGE_FRACTION = 0.4    # >40% of the plan's docs changed in one check
+# Field-label text that must never appear inside a clean document name. If it
+# does, the page was scraped before its CSS applied (a degraded capture); we
+# refuse to diff it. Belt-and-suspenders behind the .doc-info extraction.
+LABEL_SENTINEL = "שם המסמך"
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -183,6 +196,29 @@ EXPAND_NESTED_JS = r"""
 
 EXTRACT_ALL_ROWS_JS = r"""
 (sections) => {
+    // Read a cell's real value while IGNORING the responsive field labels
+    // (<span class="uk-hidden@m file-desc">שם המסמך / תאור המסמך / תאריך עריכה /
+    // תחולה</span>). Those labels are display:none on desktop, but if the page's
+    // CSS bundle hasn't applied yet when we scrape they leak into innerText and
+    // make every row look different from the baseline (the false-change storms
+    // that OOM'd the instance). The name/description values carry class
+    // .doc-info; the date/scope values have no class, so we strip the label
+    // spans and read the remaining text. Either path gives the same result
+    // whether or not the stylesheet has applied.
+    const field = (cell) => {
+        if (!cell) return '';
+        const di = [...cell.querySelectorAll('.doc-info')]
+            .map(e => (e.textContent || '').trim()).filter(Boolean);
+        let s;
+        if (di.length) {
+            s = di.join(' ');
+        } else {
+            const clone = cell.cloneNode(true);
+            clone.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
+            s = clone.textContent || '';
+        }
+        return s.trim().replace(/\s+/g, ' ');
+    };
     const result = {};
     document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
         const title = li.querySelector(':scope > .uk-accordion-title');
@@ -206,9 +242,9 @@ EXTRACT_ALL_ROWS_JS = r"""
                 /\bli-file\b/.test(c.className || '') && !/\bli-date\b/.test(c.className || ''));
             rows.push({
                 category,
-                name: nameCell ? (nameCell.innerText || '').trim().replace(/\s+/g, ' ') : '',
-                scope: scopeCell ? (scopeCell.innerText || '').trim() : '',
-                edit_date: (dateCell.innerText || '').trim(),
+                name: field(nameCell),
+                scope: field(scopeCell),
+                edit_date: field(dateCell),
             });
         });
         result[match] = rows;
@@ -314,8 +350,17 @@ def _do_capture(page, url):
     plan_number = ""
     plan_title = ""
 
-    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    t = _step("goto + domcontentloaded", t)
+    # Wait for the `load` event, not just domcontentloaded: `load` blocks until
+    # the render-blocking CSS bundle has applied, which is what hides the field
+    # labels. domcontentloaded fires before the stylesheet, which is exactly the
+    # window where the labels leak. `load` also waits for images/fonts, so under
+    # a stuck asset it can time out; that's fine — the content wait below plus
+    # the .doc-info extraction don't depend on it, so we continue.
+    try:
+        page.goto(url, wait_until="load", timeout=60_000)
+        t = _step("goto + load", t)
+    except PWTimeout:
+        t = _step("goto + load TIMEOUT (continuing)", t)
 
     try:
         page.wait_for_function(
@@ -398,99 +443,34 @@ def _do_capture(page, url):
     }
 
 
-_capture_queue: queue.Queue = queue.Queue()
-_capture_worker_started = False
+# A single lock guards ALL Playwright/Chromium use (captures and downloads), so
+# at most one browser process is alive at any moment. Each capture launches a
+# fresh browser and tears it down afterward: this isolates every check (no
+# shared cookies/cache/state across plans) and bounds memory — the OS reclaims
+# everything on browser close, so nothing creeps across checks. At a 10-minute
+# cadence the ~1s launch cost is irrelevant.
+_browser_lock = threading.Lock()
 
 
 def _new_ctx(browser):
     return browser.new_context(locale="he-IL", viewport={"width": 1500, "height": 1100})
 
 
-def _prewarm_mavat(ctx):
-    try:
-        t = time.perf_counter()
-        wp = ctx.new_page()
-        wp.goto("https://mavat.iplan.gov.il/", wait_until="domcontentloaded", timeout=60_000)
-        wp.wait_for_timeout(3_000)
-        wp.close()
-        _step("prewarm mavat homepage", t)
-    except Exception as exc:
-        print(f"[browser] prewarm failed: {type(exc).__name__}: {exc}", flush=True)
-
-
-def _capture_worker():
-    print("[browser] starting capture worker", flush=True)
-    try:
-        t = time.perf_counter()
-        pw = sync_playwright().start()
-        t = _step("sync_playwright().start()", t)
-        browser = pw.chromium.launch(headless=True)
-        t = _step("chromium.launch()", t)
-        ctx = _new_ctx(browser)
-        t = _step("shared context", t)
-        _prewarm_mavat(ctx)
-        print("[browser] capture worker ready", flush=True)
-    except Exception as exc:
-        print(f"[browser] worker failed to start: {type(exc).__name__}: {exc}", flush=True)
-        return
-
-    while True:
-        url, result_q = _capture_queue.get()
-        if url is None:
-            break
-        try:
-            p_t = time.perf_counter()
-            page = ctx.new_page()
-            _step("new_page (shared ctx)", p_t)
+def capture(url):
+    cap_t = time.perf_counter()
+    with _browser_lock:
+        _step("capture() acquired browser lock", cap_t)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
             try:
-                result = _do_capture(page, url)
-                result_q.put(("ok", result))
+                ctx = _new_ctx(browser)
+                page = ctx.new_page()
+                return _do_capture(page, url)
             finally:
-                close_t = time.perf_counter()
                 try:
-                    page.close()
+                    browser.close()
                 except Exception:
                     pass
-                _step("page.close()", close_t)
-        except Exception as exc:
-            result_q.put(("err", exc))
-            try:
-                ctx.close()
-            except Exception:
-                pass
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                browser = pw.chromium.launch(headless=True)
-                ctx = _new_ctx(browser)
-                print("[browser] worker restarted browser+context after error", flush=True)
-            except Exception as exc2:
-                print(f"[browser] restart failed: {exc2}", flush=True)
-                return
-
-
-def _ensure_capture_worker():
-    global _capture_worker_started
-    if not _capture_worker_started:
-        _capture_worker_started = True
-        threading.Thread(target=_capture_worker, daemon=True).start()
-
-
-def capture(url):
-    _ensure_capture_worker()
-    enq_t = time.perf_counter()
-    result_q: queue.Queue = queue.Queue()
-    _capture_queue.put((url, result_q))
-    status, payload = result_q.get(timeout=180)
-    _step("capture() incl. queue wait", enq_t)
-    if status == "err":
-        raise payload
-    return payload
-
-
-_ensure_capture_worker()
 
 
 def rows_to_json(rows_by_section):
@@ -669,21 +649,27 @@ def _find_previous_version(out_dir, safe_row, exclude):
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def download_changed_files(url, changes):
+def download_changed_files(url, changes, max_downloads=MAX_DOWNLOADS_PER_CHECK):
     targets = [c for c in changes if c.action in ("NEW", "UPDATED")]
+    if max_downloads is not None and len(targets) > max_downloads:
+        print(f"[download] {len(targets)} targets; capping to {max_downloads}, "
+              f"skipping {len(targets) - max_downloads}", flush=True)
+        targets = targets[:max_downloads]
     print(f"[download] {len(targets)} target(s) to download from {url}", flush=True)
     if not targets:
         return []
     out_dir = FILES_DIR / url_id(url)
     out_dir.mkdir(parents=True, exist_ok=True)
     saved = []
-    with sync_playwright() as pw:
+    # Share the capture lock so a download browser never runs alongside a capture
+    # browser (at most one Chromium alive at a time).
+    with _browser_lock, sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(
             locale="he-IL", viewport={"width": 1500, "height": 1100}, accept_downloads=True,
         )
         page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        page.goto(url, wait_until="load", timeout=60_000)
         page.wait_for_timeout(6_000)
         for label in SECTIONS:
             try:
@@ -700,6 +686,19 @@ def download_changed_files(url, changes):
                 marker = page.evaluate(
                     r"""(args) => {
                         const [sectionLabel, targetName] = args;
+                        // Same label-immune extraction as EXTRACT_ALL_ROWS_JS, so we
+                        // match the clean stored name regardless of CSS state.
+                        const field = (cell) => {
+                            if (!cell) return '';
+                            const di = [...cell.querySelectorAll('.doc-info')]
+                                .map(e => (e.textContent || '').trim()).filter(Boolean);
+                            let s;
+                            if (di.length) { s = di.join(' '); }
+                            else { const c = cell.cloneNode(true);
+                                   c.querySelectorAll('.uk-hidden\\@m').forEach(e => e.remove());
+                                   s = c.textContent || ''; }
+                            return s.trim().replace(/\s+/g, ' ');
+                        };
                         document.querySelectorAll('[data-mavat-target]').forEach(e => e.removeAttribute('data-mavat-target'));
                         let panel = null;
                         document.querySelectorAll('ul.uk-accordion > li').forEach(li => {
@@ -718,7 +717,7 @@ def download_changed_files(url, changes):
                             candidates++;
                             const nameCell = cells.find(c => /uk-width-expand|widthTitle/.test(c.className || ''));
                             if (!nameCell) continue;
-                            const name = (nameCell.innerText || '').trim().replace(/\s+/g, ' ');
+                            const name = field(nameCell);
                             if (name === targetName) {
                                 g.setAttribute('data-mavat-target', '1');
                                 return {found: true};
@@ -1023,6 +1022,16 @@ def check_track(url, send_emails=True):
         return {"status": "capture_failed", "url": url, "total_rows": total_previous,
                 "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
 
+    # Label-pollution gate: a clean name never contains the field-label text. If
+    # any does, the page was scraped before its CSS applied (a degraded capture);
+    # .doc-info should prevent this, but if it ever slips through we refuse to
+    # diff so we can't emit a false-change storm. Baseline left untouched.
+    if any(LABEL_SENTINEL in r.name for rows in current_rows.values() for r in rows):
+        print(f"[check] capture for {url} contains field-label text "
+              f"({LABEL_SENTINEL!r}); CSS not applied, treating as failure", flush=True)
+        return {"status": "capture_failed", "url": url, "total_rows": total_previous,
+                "changes": [], "email_status": "", "whatsapp_status": "", "files": []}
+
     # Per-section preservation: a section that came back empty but had rows
     # before is almost always a partial load, so keep the old rows so we never
     # emit a storm of false per-document REMOVALs.
@@ -1098,7 +1107,18 @@ def check_track(url, send_emails=True):
     if changes:
         append_history(url, timestamp, changes)
         if send_emails:
-            files = download_changed_files(url, changes)
+            # Mass-change guard: if one check turns over a large fraction of the
+            # plan, still record + email the list, but skip the per-file download
+            # storm that drove both OOMs. (A label storm never reaches here — it's
+            # rejected above — so this guards genuine large deposits and any other
+            # unforeseen mass diff.)
+            base = max(total_previous, total_current, 1)
+            mass = len(changes) >= MASS_CHANGE_MIN and len(changes) >= MASS_CHANGE_FRACTION * base
+            if mass:
+                print(f"[check] mass change for {url}: {len(changes)} changes vs base {base}; "
+                      f"emailing the list, skipping per-file downloads", flush=True)
+            else:
+                files = download_changed_files(url, changes)
             email_status = send_email(changes, url, files=files)
             whatsapp_status = send_whatsapp(changes, url)
             print(f"[whatsapp] {whatsapp_status}", flush=True)

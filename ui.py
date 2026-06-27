@@ -23,7 +23,7 @@ from mavat_watch import (
     url_id,
 )
 
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 600
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 app = Flask(__name__, static_folder=None)
