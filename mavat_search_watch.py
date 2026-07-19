@@ -6,8 +6,8 @@
 """Independent flow: track גוש/חלקה advanced-search results on Mavat and email
 when a new plan number appears. Deliberately separate from mavat_watch.py
 (own tables, own background loop, own email) — the two flows share only the
-Postgres connection and Gmail SMTP mechanics; a failure in one cannot affect
-the other.
+Postgres connection, Gmail SMTP mechanics, and the Chromium browser lock; a
+failure in one flow's logic cannot affect the other.
 """
 from __future__ import annotations
 
@@ -15,13 +15,20 @@ import argparse
 import json
 import os
 import smtplib
-import threading
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import psycopg
 from playwright.sync_api import sync_playwright
+
+# Shared with mavat_watch.py: Render's instance can only afford one Chromium
+# at a time. Two independent per-flow locks let both flows' browsers run
+# concurrently, which starved each other for CPU/memory badly enough that
+# this flow's page loads timed out (spinner never cleared within 15s).
+# Importing the same lock object serializes Chromium use server-wide while
+# leaving every other part of each flow (tables, checkers, email) untouched.
+from mavat_watch import _browser_lock
 
 SEARCH_URL = "https://mavat.iplan.gov.il/SV3?searchEntity=0&searchType=0&entityType=0&searchMethod=2"
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -53,12 +60,6 @@ CREATE INDEX IF NOT EXISTS idx_search_history_search_id ON search_history (searc
 with psycopg.connect(DATABASE_URL) as _conn:
     _conn.execute(SCHEMA_DDL)
     _conn.commit()
-
-
-# A single lock guards all Playwright/Chromium use in this flow, mirroring
-# mavat_watch.py's approach: at most one browser alive at a time, fresh
-# browser per check so no cookies/state leak across searches.
-_browser_lock = threading.Lock()
 
 
 def _extract_plans(page, gush, parcel):
