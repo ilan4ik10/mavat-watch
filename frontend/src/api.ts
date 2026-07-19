@@ -1,4 +1,4 @@
-import type { Track } from './types';
+import type { SearchTrack, Track } from './types';
 
 async function jsonRequest<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, {
@@ -30,4 +30,17 @@ export const api = {
     jsonRequest<Track[]>(`/api/tracks/${id}/simulate-pdf`, { method: 'POST' }),
   remove: (id: string) =>
     jsonRequest<Track[]>(`/api/tracks/${id}`, { method: 'DELETE' }),
+};
+
+export const searchApi = {
+  list: () => jsonRequest<SearchTrack[]>('/api/searches'),
+  add: (gush: string, parcel: string, label: string) =>
+    jsonRequest<SearchTrack[]>('/api/searches', {
+      method: 'POST',
+      body: JSON.stringify({ gush, parcel, label }),
+    }),
+  check: (id: number) =>
+    jsonRequest<SearchTrack[]>(`/api/searches/${id}/check`, { method: 'POST' }),
+  remove: (id: number) =>
+    jsonRequest<SearchTrack[]>(`/api/searches/${id}`, { method: 'DELETE' }),
 };

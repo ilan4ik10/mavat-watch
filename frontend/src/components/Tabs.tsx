@@ -1,12 +1,13 @@
-type TabId = 'tracked' | 'add';
+export type TabId = 'tracked' | 'add' | 'searches' | 'add-search';
 
 interface Props {
   active: TabId;
   onChange: (tab: TabId) => void;
   trackedCount: number;
+  searchesCount: number;
 }
 
-export default function Tabs({ active, onChange, trackedCount }: Props) {
+export default function Tabs({ active, onChange, trackedCount, searchesCount }: Props) {
   const tab = (id: TabId, label: string) => (
     <button
       type="button"
@@ -21,9 +22,11 @@ export default function Tabs({ active, onChange, trackedCount }: Props) {
     </button>
   );
   return (
-    <div className="flex gap-1 mb-6 border-b border-gray-200">
+    <div className="flex gap-1 mb-6 border-b border-gray-200 flex-wrap">
       {tab('tracked', `תכניות במעקב (${trackedCount})`)}
       {tab('add', 'הוספת תכנית')}
+      {tab('searches', `חיפושי גוש/חלקה (${searchesCount})`)}
+      {tab('add-search', 'הוספת חיפוש')}
     </div>
   );
 }

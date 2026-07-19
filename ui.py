@@ -5,6 +5,7 @@
 # ///
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -22,8 +23,17 @@ from mavat_watch import (
     simulate_track,
     url_id,
 )
+from mavat_search_watch import (
+    add_search_track,
+    check_search_track,
+    list_search_tracks,
+    load_search_history,
+    remove_search_track,
+    track_label,
+)
 
 CHECK_INTERVAL_SECONDS = 600
+SEARCH_CHECK_INTERVAL_SECONDS = int(os.environ.get("SEARCH_CHECK_INTERVAL_SECONDS", 3600))
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 app = Flask(__name__, static_folder=None)
@@ -59,6 +69,87 @@ def background_checker():
 
 
 threading.Thread(target=background_checker, daemon=True).start()
+
+
+# --- Block/parcel search-tracking flow -------------------------------------
+# Independent from the URL-tracking flow above: its own tables, own thread,
+# own routes. A failure here never touches plan-page tracking, and vice versa.
+
+_search_locks: dict[int, threading.Lock] = {}
+_search_locks_guard = threading.Lock()
+
+
+def _search_lock(search_id: int) -> threading.Lock:
+    with _search_locks_guard:
+        lock = _search_locks.get(search_id)
+        if lock is None:
+            lock = threading.Lock()
+            _search_locks[search_id] = lock
+        return lock
+
+
+def background_search_checker():
+    while True:
+        time.sleep(SEARCH_CHECK_INTERVAL_SECONDS)
+        for track in list_search_tracks():
+            try:
+                with _search_lock(track["id"]):
+                    check_search_track(track["id"], send_emails=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[background-search] {track['id']}: {type(exc).__name__}: {exc}", flush=True)
+
+
+threading.Thread(target=background_search_checker, daemon=True).start()
+
+
+def build_search_tracks():
+    tracks = list_search_tracks()
+    return [
+        {
+            "id": t["id"],
+            "gush": t["gush"],
+            "parcel": t["parcel"],
+            "label": track_label(t),
+            "added_at": t["added_at"],
+            "last_check": t["last_check"],
+            "plan_count": t["plan_count"],
+            "history": load_search_history(t["id"], limit=10),
+        }
+        for t in tracks
+    ]
+
+
+@app.get("/api/searches")
+def api_list_searches():
+    return jsonify(build_search_tracks())
+
+
+@app.post("/api/searches")
+def api_add_search():
+    data = request.get_json(silent=True) or {}
+    gush = (data.get("gush") or "").strip()
+    if not gush:
+        return jsonify({"error": "gush required"}), 400
+    parcel = (data.get("parcel") or "").strip()
+    label = (data.get("label") or "").strip()
+    add_search_track(gush, parcel, label)
+    return jsonify(build_search_tracks()), 201
+
+
+@app.post("/api/searches/<int:search_id>/check")
+def api_check_search(search_id):
+    with _search_lock(search_id):
+        result = check_search_track(search_id)
+    if result["status"] == "not_tracked":
+        return jsonify({"error": "not found"}), 404
+    return jsonify(build_search_tracks())
+
+
+@app.delete("/api/searches/<int:search_id>")
+def api_remove_search(search_id):
+    if not remove_search_track(search_id):
+        return jsonify({"error": "not found"}), 404
+    return jsonify(build_search_tracks())
 
 
 def build_tracks():
@@ -185,7 +276,6 @@ def serve_spa(path: str = "index.html"):
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5050))
     host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
     app.run(host=host, port=port, debug=False)

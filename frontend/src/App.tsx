@@ -1,24 +1,27 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
-import type { Track } from './types';
+import { api, searchApi } from './api';
+import type { SearchTrack, Track } from './types';
 import Header from './components/Header';
-import Tabs from './components/Tabs';
+import Tabs, { type TabId } from './components/Tabs';
 import Spinner from './components/Spinner';
 import AddTrackForm from './components/AddTrackForm';
 import TrackList from './components/TrackList';
-
-type TabId = 'tracked' | 'add';
+import AddSearchTrackForm from './components/AddSearchTrackForm';
+import SearchTrackList from './components/SearchTrackList';
 
 export default function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
+  const [searches, setSearches] = useState<SearchTrack[]>([]);
   const [tab, setTab] = useState<TabId>('tracked');
   const [spinner, setSpinner] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api
-      .list()
-      .then(setTracks)
+    Promise.all([api.list(), searchApi.list()])
+      .then(([t, s]) => {
+        setTracks(t);
+        setSearches(s);
+      })
       .catch((e) => alert('שגיאה: ' + (e as Error).message))
       .finally(() => setLoading(false));
   }, []);
@@ -27,6 +30,17 @@ export default function App() {
     setSpinner(message);
     try {
       setTracks(await action());
+    } catch (e) {
+      alert('שגיאה: ' + (e as Error).message);
+    } finally {
+      setSpinner(null);
+    }
+  }
+
+  async function runSearch(message: string, action: () => Promise<SearchTrack[]>) {
+    setSpinner(message);
+    try {
+      setSearches(await action());
     } catch (e) {
       alert('שגיאה: ' + (e as Error).message);
     } finally {
@@ -50,7 +64,12 @@ export default function App() {
       <main className="max-w-2xl mx-auto">
         <Header />
         {spinner && <Spinner text={spinner} />}
-        <Tabs active={tab} onChange={setTab} trackedCount={tracks.length} />
+        <Tabs
+          active={tab}
+          onChange={setTab}
+          trackedCount={tracks.length}
+          searchesCount={searches.length}
+        />
         {tab === 'tracked' && (
           <TrackList
             tracks={tracks}
@@ -64,6 +83,22 @@ export default function App() {
               run('מוסיף את התוכנית שלך למעקב ברגעים אלה', () => api.add(url)).then(() =>
                 setTab('tracked'),
               )
+            }
+          />
+        )}
+        {tab === 'searches' && (
+          <SearchTrackList
+            tracks={searches}
+            onCheck={(id) => runSearch('בודק את החיפוש ברגעים אלה', () => searchApi.check(id))}
+            onRemove={(id) => runSearch('מסיר את החיפוש מהמעקב', () => searchApi.remove(id))}
+          />
+        )}
+        {tab === 'add-search' && (
+          <AddSearchTrackForm
+            onAdd={(gush, parcel, label) =>
+              runSearch('מוסיף את החיפוש שלך למעקב ברגעים אלה', () =>
+                searchApi.add(gush, parcel, label),
+              ).then(() => setTab('searches'))
             }
           />
         )}

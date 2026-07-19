@@ -29,3 +29,23 @@ export interface Track {
   history: HistoryEntry[];
   history_count: number;
 }
+
+export interface SearchHistoryEntry {
+  ts: string;
+  plan_id: string;
+  plan_number: string;
+  plan_name: string;
+  auth_name: string;
+  status: string;
+}
+
+export interface SearchTrack {
+  id: number;
+  gush: string;
+  parcel: string;
+  label: string;
+  added_at: string;
+  last_check: string;
+  plan_count: number;
+  history: SearchHistoryEntry[];
+}
