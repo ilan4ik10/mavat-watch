@@ -28,6 +28,7 @@ from mavat_search_watch import (
     check_search_track,
     list_search_tracks,
     load_search_history,
+    rebase_search_track,
     remove_search_track,
     track_label,
 )
@@ -141,6 +142,15 @@ def api_check_search(search_id):
     with _search_lock(search_id):
         result = check_search_track(search_id)
     if result["status"] == "not_tracked":
+        return jsonify({"error": "not found"}), 404
+    return jsonify(build_search_tracks())
+
+
+@app.post("/api/searches/<int:search_id>/rebase")
+def api_rebase_search(search_id):
+    with _search_lock(search_id):
+        result = rebase_search_track(search_id)
+    if result is None:
         return jsonify({"error": "not found"}), 404
     return jsonify(build_search_tracks())
 

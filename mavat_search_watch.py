@@ -62,12 +62,18 @@ _browser_lock = threading.Lock()
 
 
 def _extract_plans(page, gush, parcel):
-    captured = {}
+    # The search UI shows results 20 at a time behind a "הצג עוד" (show more)
+    # button rather than a single page; a search matching >20 plans silently
+    # truncates to the first 20 unless we click through every page. Missing
+    # that caused both an undercount and false NEW-plan detections (plans
+    # shifting across the page-20 boundary as sort order changed looked like
+    # new arrivals). Collect every page's response before reading results.
+    responses = []
 
     def on_response(resp):
         if resp.url.endswith("/rest/api/sv3/Search"):
             try:
-                captured["body"] = resp.json()
+                responses.append(resp.json())
             except Exception:
                 pass
 
@@ -93,20 +99,39 @@ def _extract_plans(page, gush, parcel):
     search_btn.first.click(timeout=15_000)
     page.wait_for_timeout(5_000)
 
+    show_more = page.locator('button:has-text("הצג עוד"), a:has-text("הצג עוד")').locator("visible=true")
+    for _ in range(50):  # hard cap so a stuck button can't loop forever
+        if show_more.count() == 0:
+            break
+        try:
+            show_more.first.click(timeout=5_000)
+        except Exception:
+            break
+        page.wait_for_timeout(3_000)
+
     plans = []
-    for entry in captured.get("body") or []:
-        result = entry.get("result") or {}
-        for row in result.get("dtResults") or []:
-            plan_id = row.get("PLAN_ID")
-            if plan_id is None:
+    seen_ids = set()
+    for entry in responses:
+        result_list = entry if isinstance(entry, list) else [entry]
+        for item in result_list:
+            result = (item or {}).get("result") or {}
+            if result.get("searchEntity") != 1:
                 continue
-            plans.append({
-                "plan_id": str(int(plan_id)),
-                "plan_number": row.get("ENTITY_NUMBER") or "",
-                "plan_name": row.get("ENTITY_NAME") or "",
-                "auth_name": row.get("AUTH_NAME") or "",
-                "status": row.get("INTERNET_SHORT_STATUS") or row.get("UNIFIED_STATUS_DESC") or "",
-            })
+            for row in result.get("dtResults") or []:
+                plan_id = row.get("PLAN_ID")
+                if plan_id is None:
+                    continue
+                plan_id = str(int(plan_id))
+                if plan_id in seen_ids:
+                    continue
+                seen_ids.add(plan_id)
+                plans.append({
+                    "plan_id": plan_id,
+                    "plan_number": row.get("ENTITY_NUMBER") or "",
+                    "plan_name": row.get("ENTITY_NAME") or "",
+                    "auth_name": row.get("AUTH_NAME") or "",
+                    "status": row.get("INTERNET_SHORT_STATUS") or row.get("UNIFIED_STATUS_DESC") or "",
+                })
     return plans
 
 
@@ -174,6 +199,26 @@ def add_search_track(gush, parcel="", label=""):
         ).fetchone()
         conn.commit()
     return {"id": row[0], "gush": gush, "parcel": parcel, "label": label, "plan_count": len(plan_ids)}
+
+
+def rebase_search_track(search_id):
+    """Reset a tracked search's known-plans baseline to whatever the search
+    currently returns, with no history rows and no email. For adopting a
+    capture-logic fix (e.g. the pagination fix) without every plan the old
+    capture had missed firing a false 'new plan' alert."""
+    track = load_search_track(search_id)
+    if not track:
+        return None
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    plans = search_plans(track["gush"], track["parcel"])
+    plan_ids = [p["plan_id"] for p in plans]
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(
+            "UPDATE tracked_searches SET last_check = %s, known_plan_ids = %s::jsonb, plan_count = %s WHERE id = %s",
+            (timestamp, json.dumps(plan_ids), len(plan_ids), search_id),
+        )
+        conn.commit()
+    return {"id": search_id, "plan_count": len(plan_ids)}
 
 
 def remove_search_track(search_id):
