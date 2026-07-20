@@ -62,6 +62,12 @@ with psycopg.connect(DATABASE_URL) as _conn:
     _conn.commit()
 
 
+def _search_response(page):
+    return page.expect_response(
+        lambda r: r.url.endswith("/rest/api/sv3/Search"), timeout=30_000
+    )
+
+
 def _extract_plans(page, gush, parcel):
     # The search UI shows results 20 at a time behind a "הצג עוד" (show more)
     # button rather than a single page; a search matching >20 plans silently
@@ -69,16 +75,14 @@ def _extract_plans(page, gush, parcel):
     # that caused both an undercount and false NEW-plan detections (plans
     # shifting across the page-20 boundary as sort order changed looked like
     # new arrivals). Collect every page's response before reading results.
+    #
+    # Each click is paired with expect_response instead of a blind sleep:
+    # under load the response can take longer than a fixed wait, and a blind
+    # sleep that fires too early silently drops that page's rows with no
+    # error — which is exactly what caused some searches to keep landing on
+    # an incomplete count. Waiting on the actual response removes that race.
     responses = []
 
-    def on_response(resp):
-        if resp.url.endswith("/rest/api/sv3/Search"):
-            try:
-                responses.append(resp.json())
-            except Exception:
-                pass
-
-    page.on("response", on_response)
     page.goto(SEARCH_URL, wait_until="load", timeout=60_000)
     page.wait_for_timeout(1_500)
 
@@ -97,18 +101,26 @@ def _extract_plans(page, gush, parcel):
         page.wait_for_timeout(300)
 
     search_btn = page.locator('button[aria-label="חיפוש"]').locator("visible=true")
-    search_btn.first.click(timeout=15_000)
-    page.wait_for_timeout(5_000)
+    with _search_response(page) as resp_info:
+        search_btn.first.click(timeout=15_000)
+    try:
+        responses.append(resp_info.value.json())
+    except Exception:
+        pass
+    page.wait_for_timeout(500)
 
-    show_more = page.locator('button:has-text("הצג עוד"), a:has-text("הצג עוד")').locator("visible=true")
     for _ in range(50):  # hard cap so a stuck button can't loop forever
+        show_more = page.locator('button:has-text("הצג עוד"), a:has-text("הצג עוד")').locator("visible=true")
         if show_more.count() == 0:
             break
         try:
-            show_more.first.click(timeout=5_000)
+            show_more.first.scroll_into_view_if_needed(timeout=5_000)
+            with _search_response(page) as resp_info:
+                show_more.first.click(timeout=5_000)
+            responses.append(resp_info.value.json())
         except Exception:
             break
-        page.wait_for_timeout(3_000)
+        page.wait_for_timeout(500)
 
     plans = []
     seen_ids = set()
