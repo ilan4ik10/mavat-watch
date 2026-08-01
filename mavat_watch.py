@@ -194,6 +194,20 @@ EXPAND_NESTED_JS = r"""
 """
 
 
+# After EXPAND_NESTED_JS clicks a round of nested toggles, the accordion
+# content renders asynchronously; a fixed sleep can fire before it's actually
+# populated, silently capturing a category as empty. Wait for confirmation
+# instead of guessing — every currently-open li either has no content
+# container or has already-rendered children. Vacuously true when there's no
+# nested accordion on the page at all, so this never blocks unrelated plans.
+WAIT_NESTED_OPEN_JS = r"""
+() => [...document.querySelectorAll('li.uk-open')].every(li => {
+    const content = li.querySelector(':scope > .uk-accordion-content');
+    return !content || content.children.length > 0;
+})
+"""
+
+
 EXTRACT_ALL_ROWS_JS = r"""
 (sections) => {
     // Read a cell's full text but DROP the responsive field labels
@@ -398,7 +412,10 @@ def _do_capture(page, url):
             break
         expand_iters += 1
         expand_clicks += clicked
-        page.wait_for_timeout(400)
+        try:
+            page.wait_for_function(WAIT_NESTED_OPEN_JS, timeout=3_000)
+        except PWTimeout:
+            pass
     t = _step(f"expand nested ({expand_iters} iters, {expand_clicks} clicks)", t)
 
     page.wait_for_timeout(500)
